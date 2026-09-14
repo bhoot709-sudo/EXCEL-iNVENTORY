@@ -1,0 +1,10 @@
+{
+  "name": "Remix Phone \u0026 Gadget Inventory Excel Hub",
+  "description": "Retail phones and gadgets inventory spreadsheet manager with profit margin tracking, customer loyalty CRM, low stock alerts, barcode scanning, returns handling, payment QR codes, and billing invoices.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

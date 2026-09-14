@@ -1,0 +1,84 @@
+{
+  "entities": {
+    "InventoryItem": {
+      "collection": "inventory",
+      "fields": {
+        "id": { "type": "string", "description": "Unique item ID (sku or barcode)" },
+        "sku": { "type": "string", "description": "Stock Keeping Unit code" },
+        "barcode": { "type": "string", "description": "Scannable EAN/UPC barcode" },
+        "name": { "type": "string", "description": "Product model name" },
+        "category": { "type": "string", "description": "Smartphones, Tablets, Smartwatches, Audio, etc." },
+        "brand": { "type": "string", "description": "Brand manufacturer name" },
+        "costPrice": { "type": "number", "description": "Wholesale acquisition cost" },
+        "sellingPrice": { "type": "number", "description": "Retail checkout price" },
+        "stockQuantity": { "type": "number", "description": "Current on-hand units in shop" },
+        "reorderLevel": { "type": "number", "description": "Minimum threshold before restock alert" },
+        "imeiList": { "type": "array", "description": "Array of serial/IMEI tracking numbers" },
+        "warrantyMonths": { "type": "number", "description": "Warranty duration in months" },
+        "supplier": { "type": "string", "description": "Vendor or distributor name" },
+        "updatedAt": { "type": "string", "description": "Timestamp of last modification" }
+      }
+    },
+    "Invoice": {
+      "collection": "invoices",
+      "fields": {
+        "id": { "type": "string", "description": "Unique invoice ID" },
+        "invoiceNumber": { "type": "string", "description": "Human-readable invoice sequence" },
+        "date": { "type": "string", "description": "Date and time of transaction" },
+        "customerId": { "type": "string", "description": "Associated customer ID if registered" },
+        "customerName": { "type": "string", "description": "Customer name" },
+        "customerPhone": { "type": "string", "description": "Contact phone number" },
+        "items": { "type": "array", "description": "List of invoiced line items" },
+        "subtotal": { "type": "number", "description": "Pre-tax total before discount" },
+        "taxRate": { "type": "number", "description": "Tax/GST percentage applied" },
+        "taxAmount": { "type": "number", "description": "Computed tax dollars" },
+        "discountAmount": { "type": "number", "description": "Store or loyalty points discount" },
+        "grandTotal": { "type": "number", "description": "Final paid amount" },
+        "totalProfit": { "type": "number", "description": "Net profit margin dollars" },
+        "paymentMethod": { "type": "string", "description": "Cash, Credit/Debit Card, UPI_QR, Store Credit" },
+        "transactionRef": { "type": "string", "description": "Payment authorization reference code" }
+      }
+    },
+    "Customer": {
+      "collection": "customers",
+      "fields": {
+        "id": { "type": "string", "description": "Customer ID" },
+        "name": { "type": "string", "description": "Full name" },
+        "phone": { "type": "string", "description": "Phone number" },
+        "email": { "type": "string", "description": "Optional email" },
+        "loyaltyPoints": { "type": "number", "description": "Current loyalty balance" },
+        "tier": { "type": "string", "description": "Bronze, Silver, Gold, Platinum" },
+        "address": { "type": "string", "description": "Physical address" },
+        "notes": { "type": "string", "description": "Preferences and purchase notes" },
+        "createdAt": { "type": "string", "description": "Date registered" }
+      }
+    },
+    "ReturnedProduct": {
+      "collection": "returns",
+      "fields": {
+        "id": { "type": "string", "description": "Return RMA ID" },
+        "invoiceNumber": { "type": "string", "description": "Reference invoice number" },
+        "productName": { "type": "string", "description": "Returned item name" },
+        "returnDate": { "type": "string", "description": "Date return was processed" },
+        "status": { "type": "string", "description": "Approved, Rejected, Pending Inspection" },
+        "refundAmount": { "type": "number", "description": "Refunded value" }
+      }
+    },
+    "DailyOrderQuery": {
+      "collection": "daily_queries",
+      "fields": {
+        "id": { "type": "string", "description": "Unique query ID" },
+        "date": { "type": "string", "description": "AD Date string YYYY-MM-DD" },
+        "time": { "type": "string", "description": "NPT Time formatted" },
+        "bsDate": { "type": "string", "description": "Bikram Sambat BS date string" },
+        "customerName": { "type": "string", "description": "Customer full name" },
+        "customerPhone": { "type": "string", "description": "Nepalese contact number" },
+        "queryType": { "type": "string", "description": "PREORDER, SPECIAL_REQUEST, PRICE_ENQUIRY, REPAIR_SERVICE, STOCK_RESERVATION" },
+        "deviceModel": { "type": "string", "description": "Target device model requested" },
+        "notes": { "type": "string", "description": "Customer requirement details and query notes" },
+        "priority": { "type": "string", "description": "LOW, MEDIUM, HIGH, URGENT" },
+        "status": { "type": "string", "description": "PENDING, FOLLOWED_UP, FULFILLED, CANCELLED" }
+      }
+    }
+  }
+}
