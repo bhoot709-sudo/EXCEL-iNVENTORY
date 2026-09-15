@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { 
   Search, 
   Plus, 
@@ -23,6 +23,16 @@ import { StockBarcodeLabelModal } from './StockBarcodeLabelModal';
 import { BarcodeScannerModal } from './BarcodeScannerModal';
 import { useToast } from './Toast';
 import { formatNPR } from '../utils/nepalLocale';
+
+const DEFAULT_CATEGORIES: ProductCategory[] = [
+  'Smartphones',
+  'Tablets',
+  'Audio',
+  'Wearables',
+  'Chargers & Power',
+  'Protection & Cases',
+  'Cables & Adapters',
+];
 
 function highlightMatch(text: string, query: string) {
   if (!query || !query.trim()) return text;
@@ -179,6 +189,65 @@ export function InventoryManager({
   const [supplier, setSupplier] = useState('');
   const [imeiRequired, setImeiRequired] = useState(true);
 
+  // Custom Category State
+  const [customCategories, setCustomCategories] = useState<string[]>(() => {
+    try {
+      const saved = localStorage.getItem('retail_custom_categories');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [showCustomCategoryInput, setShowCustomCategoryInput] = useState(false);
+  const [newCategoryName, setNewCategoryName] = useState('');
+  const [categoryCreationError, setCategoryCreationError] = useState<string | null>(null);
+
+  // Compute all unique available categories
+  const allCategories = useMemo(() => {
+    const combined = Array.from(
+      new Set([
+        ...DEFAULT_CATEGORIES,
+        ...customCategories,
+        ...inventory.map((i) => i.category).filter(Boolean),
+      ])
+    );
+    return combined;
+  }, [customCategories, inventory]);
+
+  const handleCreateCustomCategory = () => {
+    const trimmed = newCategoryName.trim();
+    if (!trimmed) {
+      setCategoryCreationError('Please enter category name (e.g. Gaming Gear, Smart Home)');
+      return;
+    }
+    const alreadyExists = allCategories.some(
+      (c) => c.toLowerCase() === trimmed.toLowerCase()
+    );
+    if (alreadyExists) {
+      const existing = allCategories.find((c) => c.toLowerCase() === trimmed.toLowerCase())!;
+      setCategory(existing as any);
+      setShowCustomCategoryInput(false);
+      setNewCategoryName('');
+      setCategoryCreationError(null);
+      toast.info(`Category "${existing}" already exists and has been selected.`);
+      return;
+    }
+
+    const updated = [...customCategories, trimmed];
+    setCustomCategories(updated);
+    try {
+      localStorage.setItem('retail_custom_categories', JSON.stringify(updated));
+    } catch {
+      // ignore
+    }
+
+    setCategory(trimmed as any);
+    setNewCategoryName('');
+    setShowCustomCategoryInput(false);
+    setCategoryCreationError(null);
+    toast.success(`Custom category "${trimmed}" created and selected!`, 'New Category');
+  };
+
   // Calculations for Add/Edit Modal
   const modalProfit = Math.max(0, sellingPrice - costPrice);
   const modalMargin = sellingPrice > 0 ? (modalProfit / sellingPrice) * 100 : 0;
@@ -189,6 +258,9 @@ export function InventoryManager({
     setName('');
     setBrand('');
     setCategory('Smartphones');
+    setShowCustomCategoryInput(false);
+    setNewCategoryName('');
+    setCategoryCreationError(null);
     setSku(`GAD-${Math.floor(1000 + Math.random() * 9000)}`);
     setBarcodeVal(`${Math.floor(100000000000 + Math.random() * 900000000000)}`);
     setCostPrice(100);
@@ -205,6 +277,9 @@ export function InventoryManager({
     setName(item.name);
     setBrand(item.brand);
     setCategory(item.category);
+    setShowCustomCategoryInput(false);
+    setNewCategoryName('');
+    setCategoryCreationError(null);
     setSku(item.sku);
     setBarcodeVal(item.barcode);
     setCostPrice(item.costPrice);
@@ -254,12 +329,27 @@ export function InventoryManager({
       }
     }
 
+    let finalCategory: string = category;
+    if (showCustomCategoryInput && newCategoryName.trim()) {
+      const trimmed = newCategoryName.trim();
+      if (!customCategories.some((c) => c.toLowerCase() === trimmed.toLowerCase())) {
+        const updated = [...customCategories, trimmed];
+        setCustomCategories(updated);
+        try {
+          localStorage.setItem('retail_custom_categories', JSON.stringify(updated));
+        } catch {
+          // ignore
+        }
+      }
+      finalCategory = trimmed;
+    }
+
     if (editingItem) {
       onUpdateItem({
         ...editingItem,
         name: name.trim(),
         brand: brand.trim(),
-        category,
+        category: finalCategory as ProductCategory,
         sku: trimmedSku,
         barcode: trimmedBarcode,
         costPrice,
@@ -275,7 +365,7 @@ export function InventoryManager({
         id: `prod-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         name: name.trim(),
         brand: brand.trim(),
-        category,
+        category: finalCategory as ProductCategory,
         sku: trimmedSku,
         barcode: trimmedBarcode,
         costPrice,
@@ -535,7 +625,7 @@ export function InventoryManager({
 
       {/* Category Pills */}
       <div className="flex items-center gap-1.5 overflow-x-auto pb-1 scrollbar-thin">
-        {['All', 'Smartphones', 'Audio', 'Wearables', 'Chargers & Power', 'Protection & Cases', 'Cables & Adapters'].map((cat) => (
+        {['All', ...allCategories].map((cat) => (
           <button
             key={cat}
             onClick={() => setSelectedCategory(cat)}
@@ -833,20 +923,110 @@ export function InventoryManager({
                 </div>
 
                 <div>
-                  <label className="block text-slate-600 mb-0.5 text-[11px] font-medium">Category</label>
+                  <div className="flex items-center justify-between mb-0.5">
+                    <label className="block text-slate-600 text-[11px] font-medium">Category</label>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowCustomCategoryInput(!showCustomCategoryInput);
+                        setCategoryCreationError(null);
+                      }}
+                      className="text-[11px] font-semibold text-emerald-700 hover:text-emerald-800 flex items-center gap-0.5 transition-colors"
+                      title="Add a custom product category"
+                    >
+                      <Plus className="w-3 h-3" />
+                      <span>{showCustomCategoryInput ? 'Choose Standard' : '+ Custom Category'}</span>
+                    </button>
+                  </div>
                   <select
-                    value={category}
-                    onChange={(e) => setCategory(e.target.value as any)}
-                    className="w-full px-2.5 py-1.5 border border-slate-200 rounded-lg bg-white text-xs"
+                    value={showCustomCategoryInput ? '__NEW_CUSTOM__' : category}
+                    onChange={(e) => {
+                      if (e.target.value === '__NEW_CUSTOM__') {
+                        setShowCustomCategoryInput(true);
+                        setCategoryCreationError(null);
+                      } else {
+                        setCategory(e.target.value as any);
+                        setShowCustomCategoryInput(false);
+                        setCategoryCreationError(null);
+                      }
+                    }}
+                    className="w-full px-2.5 py-1.5 border border-slate-200 rounded-lg bg-white text-xs focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500"
                   >
-                    <option value="Smartphones">Smartphones</option>
-                    <option value="Tablets">Tablets</option>
-                    <option value="Audio">Audio</option>
-                    <option value="Wearables">Wearables</option>
-                    <option value="Chargers & Power">Chargers & Power</option>
-                    <option value="Protection & Cases">Protection & Cases</option>
-                    <option value="Cables & Adapters">Cables & Adapters</option>
+                    <optgroup label="Standard Categories">
+                      {DEFAULT_CATEGORIES.map((cat) => (
+                        <option key={cat} value={cat}>{cat}</option>
+                      ))}
+                    </optgroup>
+                    {customCategories.length > 0 && (
+                      <optgroup label="Custom Categories">
+                        {customCategories.map((cat) => (
+                          <option key={cat} value={cat}>{cat}</option>
+                        ))}
+                      </optgroup>
+                    )}
+                    <optgroup label="Create New">
+                      <option value="__NEW_CUSTOM__">➕ + Create New Category...</option>
+                    </optgroup>
                   </select>
+
+                  {/* Dropdown Section for Custom Category to Create New Category */}
+                  {showCustomCategoryInput && (
+                    <div className="mt-2 p-2.5 bg-slate-50 border border-emerald-300 rounded-xl space-y-1.5 animate-fadeIn">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="font-bold text-slate-800 flex items-center gap-1">
+                          <Tag className="w-3 h-3 text-emerald-600" />
+                          <span>Create New Custom Category</span>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowCustomCategoryInput(false);
+                            setNewCategoryName('');
+                            setCategoryCreationError(null);
+                          }}
+                          className="text-slate-400 hover:text-slate-600 p-0.5"
+                          title="Cancel"
+                        >
+                          ✕
+                        </button>
+                      </div>
+
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          type="text"
+                          placeholder="e.g. Gaming Gear, Smart Home, Drones..."
+                          value={newCategoryName}
+                          onChange={(e) => {
+                            setNewCategoryName(e.target.value);
+                            setCategoryCreationError(null);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              handleCreateCustomCategory();
+                            }
+                          }}
+                          autoFocus
+                          className="flex-1 px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500"
+                        />
+                        <button
+                          type="button"
+                          onClick={handleCreateCustomCategory}
+                          className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg text-xs font-bold flex items-center gap-1 shrink-0 transition-colors shadow-2xs"
+                        >
+                          <Check className="w-3.5 h-3.5" />
+                          <span>Create</span>
+                        </button>
+                      </div>
+
+                      {categoryCreationError && (
+                        <p className="text-[10px] text-rose-600 font-semibold flex items-center gap-1">
+                          <AlertTriangle className="w-3 h-3 text-rose-500 shrink-0" />
+                          <span>{categoryCreationError}</span>
+                        </p>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 <div>

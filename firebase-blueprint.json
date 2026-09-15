@@ -79,6 +79,23 @@
         "priority": { "type": "string", "description": "LOW, MEDIUM, HIGH, URGENT" },
         "status": { "type": "string", "description": "PENDING, FOLLOWED_UP, FULFILLED, CANCELLED" }
       }
+    },
+    "ShopConfig": {
+      "collection": "shop_config",
+      "fields": {
+        "id": { "type": "string", "description": "Singleton configuration ID 'default'" },
+        "shopName": { "type": "string", "description": "Shop trading name" },
+        "tagline": { "type": "string", "description": "Store branding tagline" },
+        "address": { "type": "string", "description": "Physical shop address" },
+        "phone": { "type": "string", "description": "Store contact number" },
+        "email": { "type": "string", "description": "Store official email" },
+        "taxId": { "type": "string", "description": "VAT/PAN/GSTIN ID" },
+        "currency": { "type": "string", "description": "Currency code" },
+        "currencySymbol": { "type": "string", "description": "Currency glyph" },
+        "merchantUpiId": { "type": "string", "description": "UPI/Fonepay merchant ID" },
+        "defaultTaxRate": { "type": "number", "description": "Default tax rate percentage" },
+        "returnPolicyDays": { "type": "number", "description": "Warranty return window days" }
+      }
     }
   }
 }

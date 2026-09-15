@@ -1,4 +1,4 @@
-import { useState, useId, useEffect } from 'react';
+import { useState, useId, useEffect, useMemo } from 'react';
 import { 
   Scan, 
   ShoppingCart, 
@@ -12,6 +12,7 @@ import {
   Smartphone, 
   Percent, 
   AlertCircle,
+  AlertTriangle,
   Tag,
   Users,
   Star,
@@ -69,6 +70,11 @@ export function PosBillingView({
   const [enrollNewCustomer, setEnrollNewCustomer] = useState(false);
   const [redeemPoints, setRedeemPoints] = useState<number>(0);
 
+  // Customer verification warning states
+  const [customerValidationError, setCustomerValidationError] = useState<string | null>(null);
+  const [customerNameError, setCustomerNameError] = useState(false);
+  const [customerPhoneError, setCustomerPhoneError] = useState(false);
+
   // Customer info inputs
   const [customerName, setCustomerName] = useState('');
   const [customerPhone, setCustomerPhone] = useState('');
@@ -101,6 +107,9 @@ export function PosBillingView({
     setShowCustomerDropdown(false);
     setEnrollNewCustomer(false);
     setRedeemPoints(0);
+    setCustomerValidationError(null);
+    setCustomerNameError(false);
+    setCustomerPhoneError(false);
   };
 
   const clearCustomer = () => {
@@ -110,6 +119,9 @@ export function PosBillingView({
     setCustomerEmail('');
     setCustomerSearchInput('');
     setRedeemPoints(0);
+    setCustomerValidationError(null);
+    setCustomerNameError(false);
+    setCustomerPhoneError(false);
     if (onClearPreselectedCustomer) {
       onClearPreselectedCustomer();
     }
@@ -222,12 +234,42 @@ export function PosBillingView({
   // 1 loyalty point per रु 1,000 spent
   const pointsEarned = Math.max(1, Math.floor(grandTotal / 1000));
 
-  // Process checkout with strict deduplication of invoices and customers
+  // Process checkout with strict customer verification & deduplication of invoices
   const handleProceedToPayment = () => {
     if (isProcessingSale) return;
 
     if (cart.length === 0) {
       toast.warning('Cart is empty. Scan barcodes or select items to bill.');
+      return;
+    }
+
+    // First verify any customer is selected or name & phone are provided
+    const hasSelectedCustomer = Boolean(selectedCustomer);
+    const hasName = Boolean(customerName.trim());
+    const hasPhone = Boolean(customerPhone.trim());
+
+    if (!hasSelectedCustomer && (!hasName || !hasPhone)) {
+      setCustomerNameError(!hasName);
+      setCustomerPhoneError(!hasPhone);
+
+      let msg = '';
+      if (!hasName && !hasPhone) {
+        msg = 'कृपया ग्राहक छान्नुहोस् वा नाम र फोन नम्बर भर्नुहोस् (Please select a customer or enter name & phone number)';
+      } else if (!hasName) {
+        msg = 'ग्राहकको नाम अनिवार्य छ (Customer name is required before completing sale)';
+      } else {
+        msg = 'ग्राहकको फोन नम्बर अनिवार्य छ (Phone number is required for bill & warranty)';
+      }
+
+      setCustomerValidationError(msg);
+      toast.warning(msg);
+
+      // Focus the first missing input field
+      if (!hasName) {
+        document.getElementById(customerNameId)?.focus();
+      } else if (!hasPhone) {
+        document.getElementById(customerPhoneId)?.focus();
+      }
       return;
     }
 
@@ -362,7 +404,11 @@ export function PosBillingView({
     return matchesSearch && matchesCategory;
   });
 
-  const categories = ['All', 'Smartphones', 'Wearables', 'Audio', 'Chargers & Power', 'Protection & Cases', 'Cables & Adapters'];
+  const categories = useMemo(() => {
+    const defaults = ['All', 'Smartphones', 'Tablets', 'Wearables', 'Audio', 'Chargers & Power', 'Protection & Cases', 'Cables & Adapters'];
+    const customInStock = inventory.map((i) => i.category).filter(Boolean);
+    return Array.from(new Set([...defaults, ...customInStock]));
+  }, [inventory]);
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -698,29 +744,68 @@ export function PosBillingView({
                     )}
                   </div>
 
-                  {/* Manual Guest Input (Name & Phone) */}
+                  {/* Customer Validation Error Banner */}
+                  {customerValidationError && (
+                    <div className="p-2 bg-rose-50 border border-rose-200 rounded-lg text-rose-700 text-xs font-medium flex items-start gap-1.5 animate-fadeIn">
+                      <AlertTriangle className="w-3.5 h-3.5 text-rose-600 shrink-0 mt-0.5" />
+                      <div className="flex-1">
+                        <p className="font-bold text-[11px] text-rose-800">Customer Required / ग्राहक आवश्यक छ</p>
+                        <p className="text-[10px] text-rose-600">{customerValidationError}</p>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Manual Guest Input (Name & Phone) with inline warning feedback */}
                   <div className="grid grid-cols-2 gap-2">
                     <div>
                       <label htmlFor={customerNameId} className="sr-only">Customer Name</label>
                       <input
                         id={customerNameId}
                         type="text"
-                        placeholder="Guest Name (optional)"
+                        placeholder="Customer Name *"
                         value={customerName}
-                        onChange={(e) => setCustomerName(e.target.value)}
-                        className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                        onChange={(e) => {
+                          setCustomerName(e.target.value);
+                          if (customerNameError) setCustomerNameError(false);
+                          if (customerValidationError && customerPhone.trim()) setCustomerValidationError(null);
+                        }}
+                        className={`w-full px-2.5 py-1.5 rounded-lg text-xs focus:outline-none transition-all ${
+                          customerNameError
+                            ? 'bg-rose-50/70 border border-rose-400 text-rose-900 placeholder-rose-400 focus:ring-1 focus:ring-rose-500'
+                            : 'bg-slate-50 border border-slate-200 text-slate-900 focus:ring-1 focus:ring-emerald-500'
+                        }`}
                       />
+                      {customerNameError && (
+                        <div className="flex items-center gap-1 text-[10px] font-semibold text-rose-600 mt-1">
+                          <AlertTriangle className="w-3 h-3 text-rose-500 shrink-0" />
+                          <span>Name required (नाम आवश्यक)</span>
+                        </div>
+                      )}
                     </div>
                     <div>
                       <label htmlFor={customerPhoneId} className="sr-only">Customer Phone</label>
                       <input
                         id={customerPhoneId}
                         type="text"
-                        placeholder="Phone (for warranty)"
+                        placeholder="Customer Phone *"
                         value={customerPhone}
-                        onChange={(e) => setCustomerPhone(e.target.value)}
-                        className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                        onChange={(e) => {
+                          setCustomerPhone(e.target.value);
+                          if (customerPhoneError) setCustomerPhoneError(false);
+                          if (customerValidationError && customerName.trim()) setCustomerValidationError(null);
+                        }}
+                        className={`w-full px-2.5 py-1.5 rounded-lg text-xs focus:outline-none transition-all ${
+                          customerPhoneError
+                            ? 'bg-rose-50/70 border border-rose-400 text-rose-900 placeholder-rose-400 focus:ring-1 focus:ring-rose-500'
+                            : 'bg-slate-50 border border-slate-200 text-slate-900 focus:ring-1 focus:ring-emerald-500'
+                        }`}
                       />
+                      {customerPhoneError && (
+                        <div className="flex items-center gap-1 text-[10px] font-semibold text-rose-600 mt-1">
+                          <AlertTriangle className="w-3 h-3 text-rose-500 shrink-0" />
+                          <span>Phone required (फोन आवश्यक)</span>
+                        </div>
+                      )}
                     </div>
                   </div>
 

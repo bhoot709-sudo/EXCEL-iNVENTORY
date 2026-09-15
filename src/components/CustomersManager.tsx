@@ -35,6 +35,7 @@ interface Props {
   onAdjustPoints: (customerId: string, delta: number, reason?: string) => void;
   onSelectForSale: (customer: Customer) => void;
   onViewInvoice: (invoice: Invoice) => void;
+  onOpenCustomerDuesModal?: () => void;
 }
 
 export function CustomersManager({
@@ -46,6 +47,7 @@ export function CustomersManager({
   onAdjustPoints,
   onSelectForSale,
   onViewInvoice,
+  onOpenCustomerDuesModal,
 }: Props) {
   const toast = useToast();
   const [searchQuery, setSearchQuery] = useState('');
@@ -68,6 +70,7 @@ export function CustomersManager({
   const [formAddress, setFormAddress] = useState('');
   const [formNotes, setFormNotes] = useState('');
   const [formPoints, setFormPoints] = useState<number>(0);
+  const [formDueAmount, setFormDueAmount] = useState<number>(0);
   const [formTier, setFormTier] = useState<CustomerTier>('Bronze');
 
   const openAddModal = () => {
@@ -77,6 +80,7 @@ export function CustomersManager({
     setFormAddress('');
     setFormNotes('');
     setFormPoints(0);
+    setFormDueAmount(0);
     setFormTier('Bronze');
     setEditingCustomer(null);
     setShowAddModal(true);
@@ -90,6 +94,7 @@ export function CustomersManager({
     setFormAddress(c.address || '');
     setFormNotes(c.notes || '');
     setFormPoints(c.loyaltyPoints);
+    setFormDueAmount(c.dueAmount || 0);
     setFormTier(c.tier);
     setShowAddModal(true);
   };
@@ -147,6 +152,7 @@ export function CustomersManager({
         address: formAddress.trim() || undefined,
         notes: formNotes.trim() || undefined,
         loyaltyPoints: Number(formPoints) || 0,
+        dueAmount: Number(formDueAmount) || 0,
         tier: formTier,
       };
       onUpdateCustomer(updated);
@@ -160,6 +166,7 @@ export function CustomersManager({
         address: formAddress.trim() || undefined,
         notes: formNotes.trim() || undefined,
         loyaltyPoints: Number(formPoints) || 0,
+        dueAmount: Number(formDueAmount) || 0,
         tier: formTier,
         createdAt: new Date().toISOString().split('T')[0],
       };
@@ -448,9 +455,15 @@ export function CustomersManager({
                         <Star className="w-3 h-3 fill-amber-500 text-amber-500" />
                         <span>{c.loyaltyPoints} pts</span>
                       </div>
-                      <div className="text-[10px] text-slate-500 font-mono-num mt-0.5">
-                        {custInvoices.length} orders • {formatNPR(spent)}
-                      </div>
+                      {(c.dueAmount || 0) > 0 ? (
+                        <div className="text-[10px] font-mono-num font-bold text-amber-800 bg-amber-100/90 px-1.5 py-0.5 rounded mt-0.5 inline-block">
+                          Due: {formatNPR(c.dueAmount || 0)}
+                        </div>
+                      ) : (
+                        <div className="text-[10px] text-slate-500 font-mono-num mt-0.5">
+                          {custInvoices.length} orders • {formatNPR(spent)}
+                        </div>
+                      )}
                     </div>
                   </div>
                 );
@@ -591,6 +604,38 @@ export function CustomersManager({
                     <span className="font-mono-num text-slate-200">{activeCustomer.createdAt}</span>
                   </div>
                 </div>
+              </div>
+
+              {/* Customer Due Balance / Credit Status */}
+              <div className={`p-4 rounded-2xl border flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+                (activeCustomer.dueAmount || 0) > 0 
+                  ? 'bg-amber-50/70 border-amber-200 text-amber-900' 
+                  : 'bg-slate-50 border-slate-200 text-slate-700'
+              }`}>
+                <div>
+                  <span className="text-[11px] font-bold uppercase tracking-wider block text-slate-500">
+                    Customer Due Balance (उधारो खाता)
+                  </span>
+                  <div className={`text-xl font-black font-mono-num mt-0.5 ${
+                    (activeCustomer.dueAmount || 0) > 0 ? 'text-amber-950' : 'text-slate-800'
+                  }`}>
+                    {formatNPR(activeCustomer.dueAmount || 0)}
+                  </div>
+                  <span className="text-[11px] text-slate-500">
+                    {(activeCustomer.dueAmount || 0) > 0 
+                      ? 'Outstanding credit pending counter payment settlement' 
+                      : 'Clear account with no pending dues'}
+                  </span>
+                </div>
+                {onOpenCustomerDuesModal && (
+                  <button
+                    type="button"
+                    onClick={onOpenCustomerDuesModal}
+                    className="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition-colors shadow-2xs self-start sm:self-auto"
+                  >
+                    Manage Dues (उधारो व्यवस्थापन)
+                  </button>
+                )}
               </div>
 
               {/* Customer Info & Notes */}
@@ -814,17 +859,33 @@ export function CustomersManager({
                 </div>
               </div>
 
-              <div>
-                <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                  Starting Loyalty Points (सुरुवाती पोइन्ट)
-                </label>
-                <input
-                  type="number"
-                  min="0"
-                  value={formPoints}
-                  onChange={(e) => setFormPoints(Math.max(0, parseInt(e.target.value) || 0))}
-                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono-num focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    Starting Loyalty Points (सुरुवाती पोइन्ट)
+                  </label>
+                  <input
+                    type="number"
+                    min="0"
+                    value={formPoints}
+                    onChange={(e) => setFormPoints(Math.max(0, parseInt(e.target.value) || 0))}
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono-num focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    Customer Due Balance (उधारो रकम रु)
+                  </label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={formDueAmount}
+                    onChange={(e) => setFormDueAmount(Math.max(0, parseFloat(e.target.value) || 0))}
+                    placeholder="0"
+                    className="w-full px-3 py-2 bg-amber-50/50 border border-amber-300 rounded-xl text-xs font-mono-num font-bold text-amber-900 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                  />
+                </div>
               </div>
 
               <div>

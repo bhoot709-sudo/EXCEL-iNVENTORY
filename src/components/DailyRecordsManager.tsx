@@ -28,6 +28,7 @@ import {
 import { Invoice, InventoryItem, Customer, DailyOrderQuery, QueryCategory, QueryPriority, QueryStatus } from '../types';
 import { formatNPR, formatNepaliDateTime, formatNPTTime, toBikramSambat, getTodayNPTString } from '../utils/nepalLocale';
 import { useToast } from './Toast';
+import { DailyRoutineActionBar } from './DailyRoutineActionBar';
 
 interface Props {
   invoices: Invoice[];
@@ -40,6 +41,11 @@ interface Props {
   onViewInvoice: (invoice: Invoice) => void;
   onNavigateToPosWithCustomer?: (customer: Customer, note?: string) => void;
   onExportDailySheet: (date: string, dayInvoices: Invoice[], dayQueries: DailyOrderQuery[]) => void;
+  onOpenNewSale?: () => void;
+  onOpenRestock?: () => void;
+  onOpenAddProductCategory?: () => void;
+  onOpenCustomerDues?: () => void;
+  onOpenOrderStatusUpdater?: () => void;
 }
 
 export const DailyRecordsManager: React.FC<Props> = ({
@@ -53,6 +59,11 @@ export const DailyRecordsManager: React.FC<Props> = ({
   onViewInvoice,
   onNavigateToPosWithCustomer,
   onExportDailySheet,
+  onOpenNewSale,
+  onOpenRestock,
+  onOpenAddProductCategory,
+  onOpenCustomerDues,
+  onOpenOrderStatusUpdater,
 }) => {
   const toast = useToast();
   // Default to today in NPT
@@ -318,6 +329,30 @@ export const DailyRecordsManager: React.FC<Props> = ({
           </div>
         </div>
       </div>
+
+      {/* Daily Routine Task Action Bar: New Sales, Restocks, Add Products & Categories, Customer Dues, Order Status */}
+      <DailyRoutineActionBar
+        onOpenNewSale={() => {
+          if (onOpenNewSale) onOpenNewSale();
+        }}
+        onOpenRestock={() => {
+          if (onOpenRestock) onOpenRestock();
+        }}
+        onOpenAddProductCategory={() => {
+          if (onOpenAddProductCategory) onOpenAddProductCategory();
+        }}
+        onOpenCustomerDues={() => {
+          if (onOpenCustomerDues) onOpenCustomerDues();
+        }}
+        onOpenOrderStatusUpdater={() => {
+          if (onOpenOrderStatusUpdater) onOpenOrderStatusUpdater();
+        }}
+        lowStockCount={inventory.filter((i) => i.stockQuantity <= i.reorderLevel).length}
+        customerDuesCount={customers.filter((c) => (c.dueAmount || 0) > 0).length}
+        totalDuesAmount={customers.reduce((sum, c) => sum + (c.dueAmount || 0), 0)}
+        pendingOrdersCount={queries.filter((q) => q.status === 'PENDING').length}
+        categoriesCount={new Set(inventory.map((i) => i.category)).size}
+      />
 
       {/* 4 Daily Key Performance Indicator Cards (Nepalese Rupee रु) */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">

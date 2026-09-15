@@ -16,6 +16,26 @@
     object-fit: cover !important;
     border-radius: 0.75rem;
   }
+
+  /* Custom tablet/mobile navbar slide bar styling */
+  .nav-slide-bar {
+    scrollbar-width: thin;
+    scrollbar-color: #059669 #f1f5f9;
+  }
+  .nav-slide-bar::-webkit-scrollbar {
+    height: 5px;
+  }
+  .nav-slide-bar::-webkit-scrollbar-track {
+    background: #f1f5f9;
+    border-radius: 9999px;
+  }
+  .nav-slide-bar::-webkit-scrollbar-thumb {
+    background: #10b981;
+    border-radius: 9999px;
+  }
+  .nav-slide-bar::-webkit-scrollbar-thumb:hover {
+    background: #047857;
+  }
 }
 
 @media print {

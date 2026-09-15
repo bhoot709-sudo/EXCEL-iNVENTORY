@@ -274,6 +274,7 @@ export const initialCustomers: Customer[] = [
     notes: "Corporate IT head. Purchased Samsung S24 Ultra and accessories.",
     loyaltyPoints: 480,
     tier: "VIP Platinum",
+    dueAmount: 18500, // Corporate pending credit / udhaaro balance
     createdAt: "2026-01-20",
   },
   {
@@ -285,6 +286,7 @@ export const initialCustomers: Customer[] = [
     notes: "Videographer & drone pilot. Bought DJI Osmo Pocket 3.",
     loyaltyPoints: 195,
     tier: "Silver",
+    dueAmount: 0,
     createdAt: "2026-05-18",
   },
   {
@@ -296,6 +298,7 @@ export const initialCustomers: Customer[] = [
     notes: "Bought OnePlus 12 and Spigen crystal case.",
     loyaltyPoints: 125,
     tier: "Bronze",
+    dueAmount: 4200, // Remaining due for charger & case
     createdAt: "2026-06-01",
   },
   {
@@ -307,6 +310,7 @@ export const initialCustomers: Customer[] = [
     notes: "Audio lover. Inquired about Sony WH-1000XM5.",
     loyaltyPoints: 80,
     tier: "Bronze",
+    dueAmount: 2500, // Partial due on repair service
     createdAt: "2026-07-12",
   },
 ];

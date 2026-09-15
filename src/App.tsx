@@ -21,12 +21,21 @@ import { BarcodeScannerModal } from './components/BarcodeScannerModal';
 import { PaymentQrModal } from './components/PaymentQrModal';
 import { InvoiceModal } from './components/InvoiceModal';
 import { ScannedProductDashboardModal } from './components/ScannedProductDashboardModal';
+import { CloudSyncModal } from './components/CloudSyncModal';
+import { QuickRestockModal } from './components/QuickRestockModal';
+import { AddProductCategoryModal } from './components/AddProductCategoryModal';
+import { CustomerDuesModal } from './components/CustomerDuesModal';
+import { OrderStatusUpdaterModal } from './components/OrderStatusUpdaterModal';
 import { exportToExcelWorkbook, parseExcelInventoryFileWithReport } from './utils/excelEngine';
-import { cloudSync } from './services/cloudSync';
+import { cloudSync, CloudStatusInfo } from './services/cloudSync';
 import { ToastProvider, useToast } from './components/Toast';
 
 function RetailApp() {
   const toast = useToast();
+
+  // Real-time Cloud Sync State & Diagnostics Modal
+  const [cloudStatus, setCloudStatus] = useState<CloudStatusInfo>(() => cloudSync.getCurrentStatus());
+  const [showCloudSyncModal, setShowCloudSyncModal] = useState(false);
 
   // Application Data States (persisted locally in browser localStorage as offline-first cache)
   const [inventory, setInventory] = useState<InventoryItem[]>(() => {
@@ -100,10 +109,15 @@ function RetailApp() {
 
   // Real-time Cloud Synchronization & Initial Seeding
   useEffect(() => {
-    // Seed cloud database if empty
-    cloudSync.seedInitialDataIfEmpty(inventory, invoices, customers, returns);
+    // Listen to cloud status for UI badge & diagnostics
+    const unsubStatus = cloudSync.subscribeStatus((newStatus) => {
+      setCloudStatus(newStatus);
+    });
 
-    // Listen to real-time cloud updates
+    // Seed cloud database if empty
+    cloudSync.seedInitialDataIfEmpty(inventory, invoices, customers, returns, dailyQueries, shopConfig);
+
+    // Listen to real-time cloud updates across all collections
     const unsubInv = cloudSync.subscribeInventory((cloudItems) => {
       if (cloudItems && cloudItems.length > 0) {
         setInventory(cloudItems);
@@ -128,11 +142,26 @@ function RetailApp() {
       }
     });
 
+    const unsubQueries = cloudSync.subscribeDailyQueries((cloudQueries) => {
+      if (cloudQueries && cloudQueries.length > 0) {
+        setDailyQueries(cloudQueries);
+      }
+    });
+
+    const unsubConfig = cloudSync.subscribeShopConfig((cloudConfig) => {
+      if (cloudConfig) {
+        setShopConfig(cloudConfig);
+      }
+    });
+
     return () => {
+      unsubStatus();
       unsubInv();
       unsubInvcs();
       unsubCust();
       unsubRet();
+      unsubQueries();
+      unsubConfig();
     };
   }, []);
 
@@ -156,6 +185,10 @@ function RetailApp() {
   useEffect(() => {
     localStorage.setItem('gadget_daily_queries_master', JSON.stringify(dailyQueries));
   }, [dailyQueries]);
+
+  useEffect(() => {
+    localStorage.setItem('gadget_shop_config', JSON.stringify(shopConfig));
+  }, [shopConfig]);
 
   // UI States
   const [activeTab, setActiveTab] = useState<'daily' | 'excel' | 'inventory' | 'pos' | 'customers' | 'returns' | 'monthly'>('daily');
@@ -185,6 +218,12 @@ function RetailApp() {
 
   // Active Printable Invoice View Modal
   const [activeInvoiceForModal, setActiveInvoiceForModal] = useState<Invoice | null>(null);
+
+  // Daily Routine Tasks Modals State
+  const [showQuickRestockModal, setShowQuickRestockModal] = useState(false);
+  const [showAddProductCategoryModal, setShowAddProductCategoryModal] = useState(false);
+  const [showCustomerDuesModal, setShowCustomerDuesModal] = useState(false);
+  const [showOrderStatusUpdaterModal, setShowOrderStatusUpdaterModal] = useState(false);
 
   // Hidden Excel upload input
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -220,19 +259,75 @@ function RetailApp() {
     cloudSync.deleteInventoryItem(itemId);
   };
 
-  const handleRestockQuantity = (itemId: string, addedQty: number) => {
+  const handleRestockQuantity = (
+    itemId: string, 
+    addedQty: number, 
+    newCostPrice?: number, 
+    supplier?: string
+  ) => {
     setInventory((prev) =>
       prev.map((i) => {
         if (i.id === itemId) {
           const updatedItem = {
             ...i,
             stockQuantity: i.stockQuantity + addedQty,
+            costPrice: newCostPrice !== undefined && newCostPrice > 0 ? newCostPrice : i.costPrice,
+            supplier: supplier && supplier.trim() ? supplier.trim() : i.supplier,
             lastRestockedDate: new Date().toISOString().split('T')[0],
           };
           cloudSync.saveInventoryItem(updatedItem);
           return updatedItem;
         }
         return i;
+      })
+    );
+  };
+
+  // Handlers for Customer Dues (उधारो) & Credit Settlement
+  const handleSettleCustomerDue = (
+    customerId: string, 
+    amountSettled: number, 
+    paymentMethod: string, 
+    notes?: string
+  ) => {
+    setCustomers((prev) =>
+      prev.map((c) => {
+        if (c.id === customerId) {
+          const currentDue = c.dueAmount || 0;
+          const newDue = Math.max(0, currentDue - amountSettled);
+          const logNote = `Settled रु ${amountSettled} via ${paymentMethod}${notes ? ` (${notes})` : ''}`;
+          const updatedCustomer: Customer = {
+            ...c,
+            dueAmount: newDue,
+            notes: c.notes ? `${c.notes} • ${logNote}` : logNote,
+          };
+          cloudSync.saveCustomer(updatedCustomer);
+          return updatedCustomer;
+        }
+        return c;
+      })
+    );
+  };
+
+  const handleAddCustomerCredit = (
+    customerId: string, 
+    creditAmount: number, 
+    reason?: string
+  ) => {
+    setCustomers((prev) =>
+      prev.map((c) => {
+        if (c.id === customerId) {
+          const currentDue = (c.dueAmount || 0) + creditAmount;
+          const logNote = `Credit +रु ${creditAmount}${reason ? `: ${reason}` : ''}`;
+          const updatedCustomer: Customer = {
+            ...c,
+            dueAmount: currentDue,
+            notes: c.notes ? `${c.notes} • ${logNote}` : logNote,
+          };
+          cloudSync.saveCustomer(updatedCustomer);
+          return updatedCustomer;
+        }
+        return c;
       })
     );
   };
@@ -328,22 +423,27 @@ function RetailApp() {
     });
     cloudSync.saveInvoice(inv);
 
-    // Automatically decrement inventory stock and push changes to cloud
+    // Automatically decrement inventory stock locally
     setInventory((prev) =>
       prev.map((item) => {
         const soldLine = inv.items.find((line) => line.itemId === item.id);
         if (soldLine) {
           const newQty = Math.max(0, item.stockQuantity - soldLine.quantity);
-          const updatedItem = {
+          return {
             ...item,
             stockQuantity: newQty,
           };
-          cloudSync.saveInventoryItem(updatedItem);
-          return updatedItem;
         }
         return item;
       })
     );
+
+    // Atomically decrement stock in Firestore across multi-device checkouts
+    const lineItemsToDeduct = inv.items.map((line) => ({
+      itemId: line.itemId,
+      quantity: line.quantity,
+    }));
+    cloudSync.atomicDeductStock(lineItemsToDeduct);
 
     // Apply customer update (points earned/redeemed or new customer enrollment)
     if (customerUpdate) {
@@ -538,19 +638,22 @@ function RetailApp() {
     }
   };
 
-  // Daily queries and customer order notes handlers
+  // Daily queries and customer order notes handlers with Cloud Sync
   const handleAddDailyQuery = (newQuery: DailyOrderQuery) => {
     setDailyQueries((prev) => [newQuery, ...prev]);
+    cloudSync.saveDailyQuery(newQuery);
     toast.success(`Logged note/query for ${newQuery.customerName}`, 'Daily Records');
   };
 
   const handleUpdateDailyQuery = (updated: DailyOrderQuery) => {
     setDailyQueries((prev) => prev.map((q) => (q.id === updated.id ? updated : q)));
+    cloudSync.saveDailyQuery(updated);
     toast.info(`Updated status for ${updated.customerName}`, 'Daily Records');
   };
 
   const handleDeleteDailyQuery = (queryId: string) => {
     setDailyQueries((prev) => prev.filter((q) => q.id !== queryId));
+    cloudSync.deleteDailyQuery(queryId);
     toast.info('Deleted query record.', 'Daily Records');
   };
 
@@ -558,6 +661,49 @@ function RetailApp() {
     setPosPreselectedCustomerId(customer.id);
     setActiveTab('pos');
     toast.info(`Switched to POS cashier with customer ${customer.name}`, 'Quick Checkout');
+  };
+
+  const handleConvertOrderQueryToSale = (query: DailyOrderQuery) => {
+    const cleanPhone = query.customerPhone.replace(/\D/g, '');
+    let matchedCustomer = customers.find(
+      (c) => c.phone.replace(/\D/g, '') === cleanPhone
+    );
+
+    if (!matchedCustomer) {
+      matchedCustomer = {
+        id: `cust-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        name: query.customerName,
+        phone: query.customerPhone,
+        email: '',
+        tier: 'Bronze',
+        loyaltyPoints: 0,
+        totalPurchases: 0,
+        dueAmount: 0,
+        notes: `Converted from customer inquiry (${query.deviceModel})`,
+        createdAt: new Date().toISOString().split('T')[0],
+      };
+      handleAddCustomer(matchedCustomer);
+    }
+
+    const matchedItem = inventory.find(
+      (i) =>
+        i.name.toLowerCase().includes(query.deviceModel.toLowerCase()) ||
+        query.deviceModel.toLowerCase().includes(i.name.toLowerCase())
+    );
+
+    if (matchedItem) {
+      setInitialCartItemForPos(matchedItem);
+    }
+
+    handleUpdateDailyQuery({
+      ...query,
+      status: 'FULFILLED',
+      resolutionNotes: `Fulfilled at POS on ${new Date().toLocaleDateString('en-GB')}`,
+    });
+
+    setPosPreselectedCustomerId(matchedCustomer.id);
+    setActiveTab('pos');
+    toast.success(`Converted ${query.customerName}'s order to active POS sale!`, 'POS Terminal Ready');
   };
 
   return (
@@ -579,6 +725,8 @@ function RetailApp() {
         shopConfig={shopConfig}
         customersCount={customers.length}
         dailyQueriesCount={dailyQueries.length}
+        cloudStatus={cloudStatus}
+        onOpenCloudSyncModal={() => setShowCloudSyncModal(true)}
         onExportExcel={() => exportToExcelWorkbook(inventory, invoices, returns, shopConfig, undefined, customers)}
         onImportExcel={() => fileInputRef.current?.click()}
         onOpenScanner={() => setShowScannerModal(true)}
@@ -604,6 +752,11 @@ function RetailApp() {
             onDeleteQuery={handleDeleteDailyQuery}
             onViewInvoice={(inv) => setActiveInvoiceForModal(inv)}
             onNavigateToPosWithCustomer={handleNavigateToPosWithCustomer}
+            onOpenNewSale={() => setActiveTab('pos')}
+            onOpenRestock={() => setShowQuickRestockModal(true)}
+            onOpenAddProductCategory={() => setShowAddProductCategoryModal(true)}
+            onOpenCustomerDues={() => setShowCustomerDuesModal(true)}
+            onOpenOrderStatusUpdater={() => setShowOrderStatusUpdaterModal(true)}
             onExportDailySheet={(date, dayInvoices) => {
               exportToExcelWorkbook(inventory, dayInvoices, returns, shopConfig, undefined, customers);
               toast.success(`Exported daily spreadsheet report for ${date}`, 'Spreadsheet Export');
@@ -664,6 +817,7 @@ function RetailApp() {
             onAdjustPoints={handleAdjustCustomerPoints}
             onSelectForSale={handleSelectCustomerForSale}
             onViewInvoice={(inv) => setActiveInvoiceForModal(inv)}
+            onOpenCustomerDuesModal={() => setShowCustomerDuesModal(true)}
           />
         )}
 
@@ -738,6 +892,55 @@ function RetailApp() {
           }}
         />
       )}
+
+      {/* 5. Cloud Sync Health & Multi-Device Status Modal */}
+      <CloudSyncModal
+        isOpen={showCloudSyncModal}
+        status={cloudStatus}
+        onClose={() => setShowCloudSyncModal(false)}
+        onForceRefresh={() => {
+          cloudSync.seedInitialDataIfEmpty(inventory, invoices, customers, returns, dailyQueries, shopConfig);
+          toast.info('Initiated cloud synchronizer check.', 'Cloud Sync');
+        }}
+      />
+
+      {/* 6. Daily Routine: Quick Stock Inflow / Restock Modal */}
+      <QuickRestockModal
+        isOpen={showQuickRestockModal}
+        onClose={() => setShowQuickRestockModal(false)}
+        inventory={inventory}
+        onRestockItem={handleRestockQuantity}
+      />
+
+      {/* 7. Daily Routine: Add Product & Create Custom Category Modal */}
+      <AddProductCategoryModal
+        isOpen={showAddProductCategoryModal}
+        onClose={() => setShowAddProductCategoryModal(false)}
+        inventory={inventory}
+        onAddProduct={handleAddItem}
+        onOpenScanner={() => setShowScannerModal(true)}
+      />
+
+      {/* 8. Daily Routine: Customer Dues & Credit Management Ledger Modal */}
+      <CustomerDuesModal
+        isOpen={showCustomerDuesModal}
+        onClose={() => setShowCustomerDuesModal(false)}
+        customers={customers}
+        onSettleCustomerDue={handleSettleCustomerDue}
+        onAddCustomerCredit={handleAddCustomerCredit}
+        onSelectCustomerForSale={handleSelectCustomerForSale}
+      />
+
+      {/* 9. Daily Routine: Customer Orders & Inquiries Status Updater Modal */}
+      <OrderStatusUpdaterModal
+        isOpen={showOrderStatusUpdaterModal}
+        onClose={() => setShowOrderStatusUpdaterModal(false)}
+        queries={dailyQueries}
+        customers={customers}
+        onUpdateQuery={handleUpdateDailyQuery}
+        onAddNewQuery={handleAddDailyQuery}
+        onConvertToSale={handleConvertOrderQueryToSale}
+      />
     </div>
   );
 }

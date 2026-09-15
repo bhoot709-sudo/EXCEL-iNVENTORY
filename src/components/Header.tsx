@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { 
   FileSpreadsheet, 
   Download, 
@@ -14,10 +14,15 @@ import {
   Calendar,
   Clock,
   ClipboardList,
-  GripVertical
+  CloudCheck,
+  CloudOff,
+  RefreshCw,
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 import { InventoryItem, ShopConfig } from '../types';
 import { formatNPR, getTodayBS, formatNPTTime } from '../utils/nepalLocale';
+import { CloudStatusInfo } from '../services/cloudSync';
 
 type TabKey = 'daily' | 'excel' | 'inventory' | 'pos' | 'customers' | 'returns' | 'monthly';
 
@@ -32,12 +37,14 @@ const DEFAULT_TAB_KEYS: TabKey[] = [
 ];
 
 interface Props {
-  activeTab: 'daily' | 'excel' | 'inventory' | 'pos' | 'customers' | 'returns' | 'monthly';
-  onTabChange: (tab: 'daily' | 'excel' | 'inventory' | 'pos' | 'customers' | 'returns' | 'monthly') => void;
+  activeTab: TabKey;
+  onTabChange: (tab: TabKey) => void;
   inventory: InventoryItem[];
   shopConfig: ShopConfig;
   customersCount?: number;
   dailyQueriesCount?: number;
+  cloudStatus?: CloudStatusInfo;
+  onOpenCloudSyncModal?: () => void;
   onExportExcel: () => void;
   onImportExcel: () => void;
   onOpenScanner?: () => void;
@@ -50,6 +57,8 @@ export function Header({
   shopConfig,
   customersCount,
   dailyQueriesCount,
+  cloudStatus,
+  onOpenCloudSyncModal,
   onExportExcel,
   onImportExcel,
   onOpenScanner,
@@ -61,84 +70,48 @@ export function Header({
   const totalRetail = inventory.reduce((acc, i) => acc + i.sellingPrice * i.stockQuantity, 0);
   const avgMargin = totalRetail > 0 ? ((totalRetail - totalCost) / totalRetail) * 100 : 0;
 
-  // Movable / reorderable tab navigation state with local storage persistence
-  const [tabOrder, setTabOrder] = useState<TabKey[]>(() => {
-    const saved = localStorage.getItem('gadget_nav_tab_order');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          const valid = parsed.filter((k): k is TabKey => DEFAULT_TAB_KEYS.includes(k));
-          const set = new Set(valid);
-          const missing = DEFAULT_TAB_KEYS.filter((k) => !set.has(k));
-          return [...valid, ...missing];
-        }
-      } catch {
-        // fallback to default order
-      }
+  // Slide Bar & Scroll State for Tablet & Touch View
+  const navRef = useRef<HTMLElement>(null);
+  const [canScrollLeft, setCanScrollLeft] = useState(false);
+  const [canScrollRight, setCanScrollRight] = useState(false);
+
+  const checkScroll = () => {
+    if (!navRef.current) return;
+    const { scrollLeft, scrollWidth, clientWidth } = navRef.current;
+    setCanScrollLeft(scrollLeft > 4);
+    setCanScrollRight(scrollLeft + clientWidth < scrollWidth - 4);
+  };
+
+  useEffect(() => {
+    const el = navRef.current;
+    if (!el) return;
+    checkScroll();
+    el.addEventListener('scroll', checkScroll, { passive: true });
+    window.addEventListener('resize', checkScroll);
+    return () => {
+      el.removeEventListener('scroll', checkScroll);
+      window.removeEventListener('resize', checkScroll);
+    };
+  }, []);
+
+  // Auto-scroll selected button into view to align with navbar borders on tablet
+  useEffect(() => {
+    if (!navRef.current) return;
+    const activeBtn = navRef.current.querySelector<HTMLButtonElement>(`#${tabsConfig[activeTab]?.elementId}`);
+    if (activeBtn) {
+      activeBtn.scrollIntoView({
+        behavior: 'smooth',
+        inline: 'nearest',
+        block: 'nearest'
+      });
     }
-    return DEFAULT_TAB_KEYS;
-  });
+  }, [activeTab]);
 
-  const [draggedKey, setDraggedKey] = useState<TabKey | null>(null);
-  const [dragOverKey, setDragOverKey] = useState<TabKey | null>(null);
-  const isDragActiveRef = useRef(false);
-
-  const handleDragStart = (e: React.DragEvent, key: TabKey) => {
-    isDragActiveRef.current = false;
-    setDraggedKey(key);
-    e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/plain', key);
+  const handleSlide = (direction: 'left' | 'right') => {
+    if (!navRef.current) return;
+    const amount = direction === 'left' ? -220 : 220;
+    navRef.current.scrollBy({ left: amount, behavior: 'smooth' });
   };
-
-  const handleDragOver = (e: React.DragEvent, key: TabKey) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    if (dragOverKey !== key) {
-      setDragOverKey(key);
-    }
-  };
-
-  const handleDrop = (e: React.DragEvent, targetKey: TabKey) => {
-    e.preventDefault();
-    if (!draggedKey || draggedKey === targetKey) {
-      setDraggedKey(null);
-      setDragOverKey(null);
-      return;
-    }
-    isDragActiveRef.current = true;
-    setTabOrder((prev) => {
-      const fromIndex = prev.indexOf(draggedKey);
-      const toIndex = prev.indexOf(targetKey);
-      if (fromIndex === -1 || toIndex === -1) return prev;
-      const next = [...prev];
-      const [moved] = next.splice(fromIndex, 1);
-      next.splice(toIndex, 0, moved);
-      try {
-        localStorage.setItem('gadget_nav_tab_order', JSON.stringify(next));
-      } catch {}
-      return next;
-    });
-    setDraggedKey(null);
-    setDragOverKey(null);
-  };
-
-  const handleDragEnd = () => {
-    setDraggedKey(null);
-    setDragOverKey(null);
-    setTimeout(() => {
-      isDragActiveRef.current = false;
-    }, 150);
-  };
-
-  const handleResetOrder = () => {
-    setTabOrder(DEFAULT_TAB_KEYS);
-    try {
-      localStorage.removeItem('gadget_nav_tab_order');
-    } catch {}
-  };
-
-  const isCustomOrder = tabOrder.some((k, i) => k !== DEFAULT_TAB_KEYS[i]);
 
   // Tab configurations with unified labels, subtitles, and badges
   const tabsConfig: Record<TabKey, {
@@ -210,37 +183,37 @@ export function Header({
   return (
     <header className="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-xs">
       <div className="max-w-7xl mx-auto px-4 sm:px-6">
-        {/* Top Brand & Actions Bar */}
-        <div className="py-3.5 flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-slate-100">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-2xl bg-emerald-700 text-white flex items-center justify-center font-black text-lg shadow-sm shadow-emerald-700/20">
+        {/* Top Brand & Actions Bar - Compressed height, responsive font sizes and mobile-friendly layout */}
+        <div className="py-1.5 sm:py-2 flex items-center justify-between gap-2 border-b border-slate-100">
+          <div className="flex items-center gap-2 sm:gap-2.5 min-w-0">
+            <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg sm:rounded-xl bg-emerald-700 text-white flex items-center justify-center font-black text-xs sm:text-sm shadow-xs shadow-emerald-700/20 shrink-0">
               ⚡
             </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="text-base font-extrabold text-slate-900 tracking-tight">
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5">
+                <h1 className="text-xs sm:text-sm font-extrabold text-slate-900 tracking-tight truncate max-w-[130px] xs:max-w-[180px] sm:max-w-none">
                   {shopConfig.shopName}
                 </h1>
-                <span className="px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-800 text-[10px] font-bold uppercase tracking-wider border border-emerald-200">
-                  Excel POS & Inventory
+                <span className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-800 text-[9px] sm:text-[10px] font-bold uppercase tracking-wider border border-emerald-200 hidden xs:inline-block shrink-0">
+                  Excel POS
                 </span>
               </div>
-              <p className="text-xs text-slate-500">
-                Phones, Gadgets, Stock Alerts, Barcodes, Dynamic QR & Billing Invoices
+              <p className="text-[10px] sm:text-[11px] text-slate-500 truncate max-w-[190px] sm:max-w-xs md:max-w-md hidden sm:block">
+                Phones, Gadgets, Stock Alerts, Barcodes & Invoices
               </p>
             </div>
           </div>
 
-          {/* Quick KPIs & Action Buttons */}
-          <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
+          {/* Quick KPIs & Action Buttons - Auto-adjusting sizes */}
+          <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
             {/* Nepalese BS Date & Time Pill */}
-            <div className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-50 border border-slate-200/80 text-xs">
-              <div className="flex items-center gap-1.5 font-semibold text-slate-800">
-                <Calendar className="w-3.5 h-3.5 text-emerald-600" />
-                <span>{todayBS.formattedBS} ({todayBS.dayOfWeekNepali})</span>
+            <div className="hidden lg:flex items-center gap-1.5 px-2 py-1 rounded-lg bg-slate-50 border border-slate-200/80 text-[11px]">
+              <div className="flex items-center gap-1 font-semibold text-slate-800">
+                <Calendar className="w-3 h-3 text-emerald-600" />
+                <span>{todayBS.formattedBS}</span>
               </div>
               <span className="text-slate-300">|</span>
-              <div className="flex items-center gap-1 text-slate-500 font-mono text-[11px]">
+              <div className="flex items-center gap-1 text-slate-500 font-mono text-[10px]">
                 <Clock className="w-3 h-3 text-slate-400" />
                 <span>{formatNPTTime(new Date())}</span>
               </div>
@@ -250,35 +223,62 @@ export function Header({
             {lowStockCount > 0 ? (
               <button
                 onClick={() => onTabChange('inventory')}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 text-xs font-bold hover:bg-amber-100 transition-colors animate-pulse"
+                className="flex items-center gap-1 px-2 py-1 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 text-[10px] sm:text-[11px] font-bold hover:bg-amber-100 transition-colors animate-pulse"
                 title="Click to view low stock items"
               >
-                <AlertTriangle className="w-4 h-4 text-amber-600" />
-                <span>{lowStockCount} Low Stock</span>
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                <span>{lowStockCount} <span className="hidden sm:inline">Low</span></span>
               </button>
             ) : (
-              <div className="hidden sm:flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-emerald-50 text-emerald-800 text-xs font-semibold">
-                <span>Stock Healthy</span>
+              <div className="hidden md:flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-50 text-emerald-800 text-[11px] font-semibold">
+                <span>Healthy</span>
               </div>
             )}
 
             {/* Inventory Valuation Pill */}
-            <div className="hidden lg:flex flex-col text-right px-2">
-              <span className="text-[10px] text-slate-400 uppercase font-semibold">
-                Stock Value (Wholesale)
+            <div className="hidden xl:flex flex-col text-right px-1.5">
+              <span className="text-[9px] text-slate-400 uppercase font-semibold">
+                Stock Value
               </span>
-              <span className="text-xs font-bold font-mono text-slate-800">
-                {formatNPR(totalCost)} ({avgMargin.toFixed(0)}% margin)
+              <span className="text-[11px] font-bold font-mono text-slate-800">
+                {formatNPR(totalCost)}
               </span>
             </div>
+
+            {/* Cloud Sync Status Indicator Pill & Modal Trigger */}
+            {cloudStatus && (
+              <button
+                onClick={onOpenCloudSyncModal}
+                className={`flex items-center gap-1 sm:gap-1.5 px-2 sm:px-2.5 py-1 sm:py-1.5 rounded-lg text-[10px] sm:text-xs font-semibold border transition-all ${
+                  cloudStatus.state === 'connected'
+                    ? 'bg-emerald-50 border-emerald-200 text-emerald-800 hover:bg-emerald-100'
+                    : cloudStatus.state === 'syncing'
+                    ? 'bg-amber-50 border-amber-200 text-amber-800 hover:bg-amber-100 animate-pulse'
+                    : 'bg-rose-50 border-rose-200 text-rose-800 hover:bg-rose-100'
+                }`}
+                title={`Cloud Database: ${cloudStatus.state.toUpperCase()}. Click to inspect multi-device sync status`}
+              >
+                {cloudStatus.state === 'connected' ? (
+                  <CloudCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                ) : cloudStatus.state === 'syncing' ? (
+                  <RefreshCw className="w-3.5 h-3.5 text-amber-600 shrink-0 animate-spin" />
+                ) : (
+                  <CloudOff className="w-3.5 h-3.5 text-rose-600 shrink-0" />
+                )}
+                <span className="hidden md:inline">
+                  {cloudStatus.state === 'connected' ? 'Cloud Live' :
+                   cloudStatus.state === 'syncing' ? 'Syncing...' : 'Offline'}
+                </span>
+              </button>
+            )}
 
             {/* Import Excel */}
             <button
               onClick={onImportExcel}
-              className="flex items-center gap-1 px-3 py-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 rounded-xl text-xs font-medium transition-colors"
+              className="flex items-center gap-1 px-2 sm:px-2.5 py-1 sm:py-1.5 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 rounded-lg text-[10px] sm:text-xs font-medium transition-colors"
               title="Import .xlsx spreadsheet"
             >
-              <Upload className="w-3.5 h-3.5 text-slate-500" />
+              <Upload className="w-3.5 h-3.5 text-slate-500 shrink-0" />
               <span className="hidden sm:inline">Import</span>
             </button>
 
@@ -286,10 +286,10 @@ export function Header({
             {onOpenScanner && (
               <button
                 onClick={onOpenScanner}
-                className="flex items-center gap-1.5 px-3 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold shadow-xs transition-colors"
+                className="flex items-center gap-1 sm:gap-1.5 px-2 sm:px-2.5 py-1 sm:py-1.5 bg-slate-900 hover:bg-slate-800 text-white rounded-lg text-[10px] sm:text-xs font-bold shadow-2xs transition-colors"
                 title="Scan barcode with camera, USB laser gun, or code lookup"
               >
-                <Scan className="w-4 h-4 text-emerald-400" />
+                <Scan className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                 <span className="hidden sm:inline">Scan Barcode</span>
                 <span className="sm:hidden">Scan</span>
               </button>
@@ -299,116 +299,107 @@ export function Header({
             <button
               id="header-export-excel-btn"
               onClick={onExportExcel}
-              className="flex items-center gap-1.5 px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold shadow-xs transition-colors"
+              className="flex items-center gap-1 sm:gap-1.5 px-2 sm:px-2.5 py-1 sm:py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg text-[10px] sm:text-xs font-bold shadow-2xs transition-colors"
               title="Download full multi-sheet .xlsx workbook"
             >
-              <FileSpreadsheet className="w-4 h-4" />
-              <span>Export .xlsx</span>
+              <FileSpreadsheet className="w-3.5 h-3.5 shrink-0" />
+              <span className="hidden sm:inline">Export .xlsx</span>
+              <span className="sm:hidden">Export</span>
             </button>
           </div>
         </div>
 
-        {/* Tab Navigation with Movable Tabs and Unified Hover Feedback Spans */}
-        <nav 
-          className="flex items-center gap-2 overflow-x-auto md:overflow-visible py-2.5 pb-3 scrollbar-thin select-none relative"
-          aria-label="Main Navigation Tabs"
-        >
-          {tabOrder.map((key) => {
-            const tab = tabsConfig[key];
-            if (!tab) return null;
-            const Icon = tab.icon;
-            const isActive = activeTab === key;
-            const isDragged = draggedKey === key;
-            const isDragOver = dragOverKey === key && draggedKey !== key;
-
-            return (
+        {/* Tab Navigation - Slide bar on tablet, aligned with navbar border, flicker-free hover */}
+        <div className="relative">
+          {/* Left Slide Button for Tablet & Touch Screens */}
+          {canScrollLeft && (
+            <div className="absolute left-0 top-0 bottom-0 z-20 flex items-center pr-2 bg-gradient-to-r from-white via-white/90 to-transparent">
               <button
-                key={key}
-                id={tab.elementId}
-                draggable
-                onDragStart={(e) => handleDragStart(e, key)}
-                onDragOver={(e) => handleDragOver(e, key)}
-                onDrop={(e) => handleDrop(e, key)}
-                onDragEnd={handleDragEnd}
-                onClick={(e) => {
-                  if (isDragActiveRef.current) {
-                    e.preventDefault();
-                    return;
-                  }
-                  onTabChange(key);
-                }}
-                title={`${tab.label} — ${tab.nepaliLabel} • Click to switch tab • Drag to rearrange`}
-                className={`group relative flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-bold whitespace-nowrap transition-all duration-150 cursor-grab active:cursor-grabbing ${
-                  isDragged
-                    ? 'opacity-40 scale-95 ring-2 ring-dashed ring-emerald-500 bg-emerald-50/50'
-                    : isDragOver
-                    ? 'ring-2 ring-emerald-600 ring-offset-2 bg-emerald-100/80 scale-[1.03] shadow-md z-10'
-                    : isActive
-                    ? 'bg-emerald-700 text-white shadow-xs'
-                    : 'text-slate-600 hover:text-emerald-950 hover:bg-emerald-50/80 hover:shadow-xs border border-transparent hover:border-emerald-200/70 active:scale-[0.98]'
-                }`}
+                type="button"
+                onClick={() => handleSlide('left')}
+                aria-label="Slide tabs left"
+                className="w-6 h-6 sm:w-7 sm:h-7 flex items-center justify-center rounded-full bg-white text-slate-700 shadow-md border border-slate-200 hover:bg-slate-50 hover:text-emerald-700 transition-colors cursor-pointer"
               >
-                {/* Grip Handle for Movable feedback */}
-                <GripVertical
-                  className={`w-3.5 h-3.5 -ml-1 transition-all duration-200 ${
-                    isActive
-                      ? 'opacity-40 text-white group-hover:opacity-80'
-                      : 'opacity-20 text-slate-400 group-hover:opacity-75 group-hover:text-emerald-700'
-                  }`}
-                  aria-hidden="true"
-                />
-
-                {/* Tab Icon */}
-                <Icon className="w-[18px] h-[18px] flex-shrink-0 transition-transform duration-200 group-hover:scale-110" />
-
-                {/* Tab Text - Only English at rest, zero Nepali translation shown when pointer is removed */}
-                <span className="relative inline-flex items-center py-0.5 tracking-tight">
-                  <span className="font-bold">{tab.label}</span>
-
-                  {/* Unified animated hover underline accent for rich visual feedback */}
-                  <span
-                    className={`absolute -bottom-1 left-0 h-[2px] rounded-full transition-all duration-200 ${
-                      isActive
-                        ? 'w-full bg-white/80'
-                        : 'w-0 group-hover:w-full bg-emerald-600'
-                    }`}
-                  />
-                </span>
-
-                {/* Floating Nepali Translation Tooltip - Strictly hidden when pointer removed, only visible while pointer hovers */}
-                <div className="pointer-events-none absolute top-full mt-1.5 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 translate-y-1 group-hover:translate-y-0 transition-all duration-150 z-50 px-2.5 py-1 bg-slate-900 text-emerald-300 text-xs font-semibold rounded-lg shadow-xl whitespace-nowrap border border-slate-700/80 flex items-center gap-1.5">
-                  <span className="font-bold text-emerald-300">{tab.nepaliLabel}</span>
-                  <span className="text-[10px] text-slate-400">({tab.label})</span>
-                </div>
-
-                {/* Badge if present */}
-                {tab.badge && (
-                  <span
-                    className={`px-2 py-0.5 text-xs rounded-full font-bold transition-transform duration-150 group-hover:scale-105 ${tab.badge.className}`}
-                  >
-                    {tab.badge.text}
-                  </span>
-                )}
+                <ChevronLeft className="w-4 h-4" />
               </button>
-            );
-          })}
-
-          {/* Reset order button if customized */}
-          {isCustomOrder && (
-            <button
-              onClick={handleResetOrder}
-              className="group relative flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-slate-400 hover:text-emerald-800 hover:bg-emerald-50/60 rounded-xl transition-colors ml-1 whitespace-nowrap border border-transparent hover:border-emerald-200/50 cursor-pointer"
-              title="नेभिगेसन क्रम पूर्वनिर्धारित बनाउनुहोस् (Reset Order)"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              <span className="text-[11px] font-semibold">Reset Order</span>
-              {/* Tooltip on hover */}
-              <div className="pointer-events-none absolute top-full mt-1.5 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 translate-y-1 group-hover:translate-y-0 transition-all duration-150 z-50 px-2.5 py-1 bg-slate-900 text-white text-[11px] font-semibold rounded-lg shadow-xl whitespace-nowrap border border-slate-700/80">
-                क्रम रिसेट गर्नुहोस्
-              </div>
-            </button>
+            </div>
           )}
-        </nav>
+
+          {/* Right Slide Button for Tablet & Touch Screens */}
+          {canScrollRight && (
+            <div className="absolute right-0 top-0 bottom-0 z-20 flex items-center pl-2 bg-gradient-to-l from-white via-white/90 to-transparent">
+              <button
+                type="button"
+                onClick={() => handleSlide('right')}
+                aria-label="Slide tabs right"
+                className="w-6 h-6 sm:w-7 sm:h-7 flex items-center justify-center rounded-full bg-white text-slate-700 shadow-md border border-slate-200 hover:bg-slate-50 hover:text-emerald-700 transition-colors cursor-pointer"
+              >
+                <ChevronRight className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
+          <nav 
+            ref={navRef}
+            className="nav-slide-bar flex items-center gap-1 sm:gap-1.5 overflow-x-auto pt-1.5 pb-0 -mb-[1px] select-none scroll-smooth relative"
+            aria-label="Main Navigation Tabs"
+          >
+            {DEFAULT_TAB_KEYS.map((key) => {
+              const tab = tabsConfig[key];
+              if (!tab) return null;
+              const Icon = tab.icon;
+              const isActive = activeTab === key;
+
+              return (
+                <button
+                  key={key}
+                  id={tab.elementId}
+                  onClick={() => onTabChange(key)}
+                  title={`${tab.label} (${tab.nepaliLabel})`}
+                  className={`group relative flex items-center gap-1.5 sm:gap-2 px-3 sm:px-3.5 py-1.5 sm:py-2 rounded-t-xl text-xs sm:text-sm font-bold whitespace-nowrap transition-all duration-150 cursor-pointer -mb-[1px] border-b-2 ${
+                    isActive
+                      ? 'border-emerald-600 bg-emerald-700 text-white shadow-xs z-10'
+                      : 'border-transparent text-slate-600 hover:text-emerald-950 hover:bg-emerald-50/80 hover:border-emerald-300'
+                  }`}
+                >
+                  {/* Tab Icon */}
+                  <Icon className={`w-4 h-4 sm:w-[18px] sm:h-[18px] shrink-0 transition-colors duration-150 ${
+                    isActive ? 'text-white' : 'text-slate-500 group-hover:text-emerald-700'
+                  }`} />
+
+                  {/* Dynamic In-Place Label with Auto-Incremental Width & Zero-Flicker Edge Preservation */}
+                  <span className="relative inline-grid grid-cols-1 grid-rows-1 items-center justify-items-center py-0.5 tracking-tight pointer-events-none">
+                    {/* English anchor to anchor min-width so button never shrinks below English text on hover */}
+                    <span className="col-start-1 row-start-1 font-bold whitespace-nowrap opacity-0 pointer-events-none select-none" aria-hidden="true">
+                      {tab.label}
+                    </span>
+
+                    {/* Dynamic switcher: English at rest, Nepali on hover with auto-incremental width expansion */}
+                    <span className="col-start-1 row-start-1 font-bold whitespace-nowrap inline-flex items-center justify-center">
+                      <span className="inline group-hover:hidden transition-all duration-150">
+                        {tab.label}
+                      </span>
+                      <span className={`hidden group-hover:inline transition-all duration-150 font-bold ${
+                        isActive ? 'text-white' : 'text-emerald-950'
+                      }`}>
+                        {tab.nepaliLabel}
+                      </span>
+                    </span>
+                  </span>
+
+                  {/* Badge if present */}
+                  {tab.badge && (
+                    <span
+                      className={`ml-0.5 px-1.5 py-0.5 text-[10px] sm:text-xs rounded-full font-bold transition-colors duration-150 ${tab.badge.className}`}
+                    >
+                      {tab.badge.text}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </nav>
+        </div>
       </div>
     </header>
   );

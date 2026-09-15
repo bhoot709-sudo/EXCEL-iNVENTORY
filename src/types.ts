@@ -5,7 +5,8 @@ export type ProductCategory =
   | 'Wearables' 
   | 'Chargers & Power' 
   | 'Protection & Cases' 
-  | 'Cables & Adapters';
+  | 'Cables & Adapters'
+  | (string & {});
 
 export interface InventoryItem {
   id: string;
@@ -56,6 +57,7 @@ export interface Customer {
   notes?: string;
   loyaltyPoints: number;
   tier: CustomerTier;
+  dueAmount?: number; // Outstanding credit / udhaaro balance
   createdAt: string;
 }
 
