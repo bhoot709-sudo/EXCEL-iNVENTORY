@@ -293,3 +293,159 @@ export function playScannerBeep(isError = false) {
     // Audio context may be restricted before user gesture, silent ignore
   }
 }
+
+/**
+ * Universal inventory lookup function for scanner:
+ * Recognizes and matches products by:
+ * 1. Exact Barcode (EAN-13, Code 128, UPC)
+ * 2. Exact App-Generated SKU (e.g. APL-SMA-IP15P-9481, SKU-IPH15P-256)
+ * 3. Case-insensitive SKU match
+ * 4. Normalized SKU match (stripping spaces, hyphens, non-alphanumerics)
+ * 5. Normalized Barcode match
+ * 6. Internal Unique Item ID
+ */
+export function findItemByBarcodeOrSku<T extends { id: string; barcode?: string; sku?: string; name?: string }>(
+  inventory: T[],
+  rawCode: string
+): T | null {
+  if (!rawCode || !Array.isArray(inventory) || inventory.length === 0) return null;
+  const clean = rawCode.trim();
+  if (!clean) return null;
+
+  const cleanLower = clean.toLowerCase();
+  const cleanAlphanumeric = cleanLower.replace(/[^a-z0-9]/g, '');
+
+  // 1. Exact barcode match
+  const matchByBarcode = inventory.find((item) => item.barcode && item.barcode.trim() === clean);
+  if (matchByBarcode) return matchByBarcode;
+
+  // 2. Exact SKU match (case-insensitive)
+  const matchBySkuExact = inventory.find(
+    (item) => item.sku && item.sku.trim().toLowerCase() === cleanLower
+  );
+  if (matchBySkuExact) return matchBySkuExact;
+
+  // 3. Normalized SKU match (ignoring dashes, slashes and whitespace)
+  if (cleanAlphanumeric.length >= 3) {
+    const matchBySkuNormalized = inventory.find((item) => {
+      if (!item.sku) return false;
+      const itemSkuClean = item.sku.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+      return itemSkuClean === cleanAlphanumeric;
+    });
+    if (matchBySkuNormalized) return matchBySkuNormalized;
+  }
+
+  // 4. Normalized Barcode match
+  if (cleanAlphanumeric.length >= 4) {
+    const matchByBarcodeNormalized = inventory.find((item) => {
+      if (!item.barcode) return false;
+      const itemBarcodeClean = item.barcode.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+      return itemBarcodeClean === cleanAlphanumeric;
+    });
+    if (matchByBarcodeNormalized) return matchByBarcodeNormalized;
+  }
+
+  // 5. Item ID exact match
+  const matchById = inventory.find((item) => item.id === clean);
+  if (matchById) return matchById;
+
+  // 6. Substring match for full app-generated SKU prefix or suffix
+  const matchBySkuPrefix = inventory.find((item) => {
+    if (!item.sku) return false;
+    const itemSku = item.sku.trim().toLowerCase();
+    return itemSku.length > 5 && (itemSku === cleanLower || itemSku.endsWith(`-${cleanLower}`));
+  });
+  if (matchBySkuPrefix) return matchBySkuPrefix;
+
+  return null;
+}
+
+/**
+ * Checks if a string conforms to the app's standard SKU format:
+ * e.g., 'APL-SMA-IP15P-9481', 'SAM-SMA-S24U-2041', 'SKU-IPH15P-256'
+ */
+export function isAppGeneratedSkuFormat(code: string): boolean {
+  if (!code) return false;
+  const clean = code.trim().toUpperCase();
+  // Standard 4-part: BRAND-CAT-MODEL-UID (e.g. APL-SMA-IP15P-9481)
+  const isFourPart = /^[A-Z0-9]{2,5}-[A-Z0-9]{2,4}-[A-Z0-9]{2,8}-[A-Z0-9]{3,6}$/.test(clean);
+  // Standard 3-part: SKU-MODEL-VARIANT (e.g. SKU-IPH15P-256)
+  const isThreePart = /^SKU-[A-Z0-9]{2,8}-[A-Z0-9]{2,8}$/.test(clean);
+  return isFourPart || isThreePart;
+}
+
+/**
+ * Analyzes an app-generated SKU to extract brand, category, model clues
+ */
+export function parseAppGeneratedSku(sku: string): {
+  isAppSku: boolean;
+  brand?: string;
+  category?: string;
+  model?: string;
+  uid?: string;
+  formatDescription?: string;
+} {
+  if (!sku) return { isAppSku: false };
+  const clean = sku.trim().toUpperCase();
+  const parts = clean.split('-');
+
+  if (parts.length === 4) {
+    const brandMap: Record<string, string> = {
+      APL: 'Apple',
+      APP: 'Apple',
+      SAM: 'Samsung',
+      XIA: 'Xiaomi',
+      RED: 'Redmi / Xiaomi',
+      ONE: 'OnePlus',
+      REA: 'Realme',
+      VIV: 'Vivo',
+      OPP: 'Oppo',
+      GOO: 'Google Pixel',
+      JBL: 'JBL',
+      SON: 'Sony',
+      ANK: 'Anker',
+      SPG: 'Spigen',
+      BAS: 'Baseus',
+      BOA: 'boAt',
+    };
+
+    const catMap: Record<string, string> = {
+      SMA: 'Smartphones',
+      TAB: 'Tablets',
+      WEA: 'Wearables / Smartwatches',
+      AUD: 'Audio & Earphones',
+      CHA: 'Chargers & Power',
+      PRO: 'Protection & Cases',
+      CAB: 'Cables & Adapters',
+      ACC: 'Accessories',
+    };
+
+    const brand = brandMap[parts[0]] || parts[0];
+    const category = catMap[parts[1]] || parts[1];
+    const model = parts[2];
+    const uid = parts[3];
+
+    return {
+      isAppSku: true,
+      brand,
+      category,
+      model,
+      uid,
+      formatDescription: `App SKU: ${brand} • ${category} (Model: ${model}, ID: #${uid})`,
+    };
+  }
+
+  if (parts.length === 3 && parts[0] === 'SKU') {
+    return {
+      isAppSku: true,
+      model: parts[1],
+      uid: parts[2],
+      formatDescription: `App SKU: Standard Retail (${parts[1]} - ${parts[2]})`,
+    };
+  }
+
+  return {
+    isAppSku: isAppGeneratedSkuFormat(sku),
+  };
+}
+

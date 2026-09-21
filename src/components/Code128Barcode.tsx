@@ -12,6 +12,7 @@ export interface Code128BarcodeProps {
   background?: string;
   lineColor?: string;
   className?: string;
+  barCount?: number;
 }
 
 export function Code128Barcode({
@@ -25,6 +26,7 @@ export function Code128Barcode({
   background = '#ffffff',
   lineColor = '#000000',
   className = '',
+  barCount = 56,
 }: Code128BarcodeProps) {
   const svgRef = useRef<SVGSVGElement | null>(null);
 
@@ -34,14 +36,18 @@ export function Code128Barcode({
         // Clean and sanitize string for Code128
         const cleanVal = value.trim();
         if (cleanVal) {
+          const densityFactor = Math.max(0.55, Math.min(2.0, barCount / 56));
+          const effectiveWidth = Math.max(0.5, Math.round(width * densityFactor * 100) / 100);
+          const effectiveMargin = Math.max(0, Math.round(margin * densityFactor));
+
           JsBarcode(svgRef.current, cleanVal, {
             format: 'CODE128',
-            width,
+            width: effectiveWidth,
             height,
             displayValue,
             fontSize,
             font,
-            margin,
+            margin: effectiveMargin,
             background,
             lineColor,
             textMargin: 3,
@@ -51,7 +57,7 @@ export function Code128Barcode({
         console.error('Error generating Code128 barcode for value:', value, err);
       }
     }
-  }, [value, width, height, displayValue, fontSize, font, margin, background, lineColor]);
+  }, [value, width, height, displayValue, fontSize, font, margin, background, lineColor, barCount]);
 
   return (
     <svg

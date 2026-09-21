@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   RotateCcw, 
   Search, 
@@ -11,11 +11,13 @@ import {
   Smartphone,
   Plus,
   Camera,
-  Scan
+  Scan,
+  ShieldCheck
 } from 'lucide-react';
-import { ReturnedProduct, InventoryItem, Invoice } from '../types';
+import { ReturnedProduct, InventoryItem, Invoice, WarrantyStatus } from '../types';
 import { useToast } from './Toast';
 import { BarcodeScannerModal } from './BarcodeScannerModal';
+import { findItemByBarcodeOrSku } from '../utils/barcodeUtils';
 
 interface Props {
   returns: ReturnedProduct[];
@@ -23,6 +25,8 @@ interface Props {
   invoices: Invoice[];
   onAddReturn: (ret: ReturnedProduct, shouldRestock: boolean, itemId?: string) => void;
   onOpenScanner: () => void;
+  initialReturnItem?: InventoryItem | null;
+  onClearInitialReturnItem?: () => void;
 }
 
 export function ReturnsManager({
@@ -31,6 +35,8 @@ export function ReturnsManager({
   invoices,
   onAddReturn,
   onOpenScanner,
+  initialReturnItem,
+  onClearInitialReturnItem,
 }: Props) {
   const toast = useToast();
   const [isSubmittingReturn, setIsSubmittingReturn] = useState(false);
@@ -53,49 +59,95 @@ export function ReturnsManager({
   const [refundAmount, setRefundAmount] = useState<number>(0);
   const [restockToShelf, setRestockToShelf] = useState<boolean>(false);
   const [notes, setNotes] = useState('');
+  const [detectedWarrantyStatus, setDetectedWarrantyStatus] = useState<WarrantyStatus>('UNDER_WARRANTY');
+  const [warrantyElapsedDays, setWarrantyElapsedDays] = useState<number | null>(null);
+
+  // Handle auto-opening with initial return item
+  useEffect(() => {
+    if (initialReturnItem) {
+      setMatchedItem(initialReturnItem);
+      setLookupKey(initialReturnItem.sku || initialReturnItem.barcode);
+      setRefundAmount(initialReturnItem.sellingPrice);
+      setDetectedWarrantyStatus('UNDER_WARRANTY');
+      setShowAddModal(true);
+      toast.info(`Preparing return for "${initialReturnItem.name}".`, 'Return Processing');
+      onClearInitialReturnItem?.();
+    }
+  }, [initialReturnItem, onClearInitialReturnItem]);
 
   // Handle lookup by invoice number, barcode, or SKU
   const handleLookup = (customKey?: string) => {
-    const key = (customKey !== undefined ? customKey : lookupKey).trim();
-    if (!key) {
+    const rawKey = (customKey !== undefined ? customKey : lookupKey).trim();
+    if (!rawKey) {
       toast.warning('Please enter or scan an invoice number, barcode, or IMEI.', 'Identification');
       return;
     }
 
-    // 1. Check invoices
+    const cleanLower = rawKey.toLowerCase();
+    const cleanAlphaNum = cleanLower.replace(/[^a-z0-9]/g, '');
+
+    // 1. Check invoices: match by invoiceNumber, barcode, SKU (exact or normalized), or IMEI
     const inv = invoices.find(
       (i) =>
-        i.invoiceNumber.toLowerCase() === key.toLowerCase() ||
-        i.items.some((it) => it.barcode === key || it.imeiList?.some((im) => im.toLowerCase() === key.toLowerCase()))
+        i.invoiceNumber.toLowerCase() === cleanLower ||
+        i.items.some((it) => {
+          const barcodeMatch = it.barcode && (it.barcode.toLowerCase() === cleanLower || it.barcode.replace(/[^a-z0-9]/g, '') === cleanAlphaNum);
+          const skuMatch = it.sku && (it.sku.toLowerCase() === cleanLower || it.sku.replace(/[^a-z0-9]/g, '') === cleanAlphaNum);
+          const imeiMatch = it.imeiList?.some((im) => im.toLowerCase() === cleanLower || im.replace(/[^a-z0-9]/g, '') === cleanAlphaNum);
+          return barcodeMatch || skuMatch || imeiMatch;
+        })
     );
 
     if (inv) {
       setMatchedInvoice(inv);
       setCustomerName(inv.customerName);
       setCustomerPhone(inv.customerPhone);
-      const matchedLine = inv.items.find(
-        (it) => it.barcode === key || it.imeiList?.some((im) => im.toLowerCase() === key.toLowerCase())
-      ) || inv.items[0];
+      const matchedLine = inv.items.find((it) => {
+        const barcodeMatch = it.barcode && (it.barcode.toLowerCase() === cleanLower || it.barcode.replace(/[^a-z0-9]/g, '') === cleanAlphaNum);
+        const skuMatch = it.sku && (it.sku.toLowerCase() === cleanLower || it.sku.replace(/[^a-z0-9]/g, '') === cleanAlphaNum);
+        const imeiMatch = it.imeiList?.some((im) => im.toLowerCase() === cleanLower || im.replace(/[^a-z0-9]/g, '') === cleanAlphaNum);
+        return barcodeMatch || skuMatch || imeiMatch;
+      }) || inv.items[0];
 
-      const invItem = inventory.find((i) => i.id === matchedLine.itemId);
+      const invItem =
+        findItemByBarcodeOrSku(inventory, matchedLine.sku) ||
+        findItemByBarcodeOrSku(inventory, matchedLine.barcode) ||
+        inventory.find((i) => i.id === matchedLine.itemId);
       if (invItem) setMatchedItem(invItem);
       setRefundAmount(matchedLine.unitPrice);
       if (matchedLine.imeiList && matchedLine.imeiList.length > 0) {
-        const foundImei = matchedLine.imeiList.find((im) => im.toLowerCase() === key.toLowerCase()) || matchedLine.imeiList[0];
+        const foundImei = matchedLine.imeiList.find((im) => im.toLowerCase() === cleanLower) || matchedLine.imeiList[0];
         setSerialOrImei(foundImei);
       }
-      toast.success(`Matched Invoice #${inv.invoiceNumber} for ${inv.customerName}`, 'Product Identified');
+
+      // Automatically determine warranty status based on invoice date!
+      const invoiceDateStr = inv.date.includes(' ') ? inv.date.split(' ')[0] : inv.date;
+      const invoiceDateObj = new Date(invoiceDateStr);
+      let isUnderWarranty = true;
+      let elapsed = 0;
+      if (!isNaN(invoiceDateObj.getTime())) {
+        elapsed = Math.max(0, Math.floor((Date.now() - invoiceDateObj.getTime()) / (1000 * 60 * 60 * 24)));
+        setWarrantyElapsedDays(elapsed);
+        isUnderWarranty = elapsed <= 365; // Standard 1-year coverage
+      }
+      const wStatus: WarrantyStatus = isUnderWarranty ? 'UNDER_WARRANTY' : 'OUT_OF_WARRANTY';
+      setDetectedWarrantyStatus(wStatus);
+
+      toast.success(
+        `Matched Invoice #${inv.invoiceNumber} for ${inv.customerName} • ${isUnderWarranty ? 'Covered under 1-Yr Warranty' : 'Warranty Expired (' + elapsed + ' days elapsed)'}`,
+        'Invoice & Warranty Verified'
+      );
       return;
     }
 
-    // 2. Check inventory directly by barcode or SKU
-    const invItem = inventory.find(
-      (i) => i.barcode === key || i.sku.toLowerCase() === key.toLowerCase()
-    );
+    // 2. Check inventory directly by barcode or SKU using unified resolution engine
+    const invItem = findItemByBarcodeOrSku(inventory, rawKey);
     if (invItem) {
       setMatchedItem(invItem);
       setRefundAmount(invItem.sellingPrice);
-      toast.success(`Identified: ${invItem.name}`, 'Stock Matched');
+      setDetectedWarrantyStatus('UNDER_WARRANTY');
+      setWarrantyElapsedDays(null);
+      toast.success(`Identified Stock: ${invItem.name} (SKU: ${invItem.sku})`, 'Stock Matched');
       return;
     }
 
@@ -169,10 +221,17 @@ export function ReturnsManager({
     try {
       const timeStamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
       const uniqueSuffix = `${Date.now().toString().slice(-4)}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+      const purchaseDate = matchedInvoice
+        ? (matchedInvoice.date.includes(' ') ? matchedInvoice.date.split(' ')[0] : matchedInvoice.date)
+        : undefined;
+
       const newReturn: ReturnedProduct = {
         id: `RMA-${timeStamp}-${uniqueSuffix}`,
         returnDate: new Date().toLocaleString(),
         invoiceNumber: matchedInvoice?.invoiceNumber || (trimmedKey.startsWith('INV-') ? trimmedKey : 'COUNTER-RETURN'),
+        purchaseDate,
+        warrantyStatus: detectedWarrantyStatus,
+        warrantyDurationMonths: 12,
         itemBarcode,
         itemName: matchedItem?.name || 'Returned Gadget',
         itemBrand: matchedItem?.brand || 'Generic',
@@ -430,16 +489,32 @@ export function ReturnsManager({
                 </div>
 
                 {matchedItem && (
-                  <div className="mt-2 p-2.5 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-900 flex items-center justify-between">
+                  <div className="mt-2 p-2.5 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-900 flex items-center justify-between gap-3">
                     <div>
-                      <p className="font-bold">{matchedItem.name}</p>
-                      <p className="text-[11px] text-emerald-700 font-mono-num">
-                        Current Stock: {matchedItem.stockQuantity} • MSRP: ${matchedItem.sellingPrice}
+                      <p className="font-bold text-sm text-slate-900">{matchedItem.name}</p>
+                      <p className="text-[11px] text-emerald-800 font-mono-num">
+                        SKU: <span className="font-bold">{matchedItem.sku}</span> • Barcode: <span className="font-bold">{matchedItem.barcode}</span> • Stock: {matchedItem.stockQuantity}
                       </p>
+                      {matchedInvoice && (
+                        <p className="text-[10.5px] text-slate-600 mt-0.5">
+                          Invoice #{matchedInvoice.invoiceNumber} • Purchased {matchedInvoice.date} {warrantyElapsedDays !== null ? `(${warrantyElapsedDays} days ago)` : ''}
+                        </p>
+                      )}
                     </div>
-                    <span className="text-[10px] px-2 py-0.5 bg-emerald-200 font-bold rounded">
-                      IDENTIFIED
-                    </span>
+                    <div className="flex flex-col items-end gap-1 shrink-0">
+                      <span className="text-[10px] px-2 py-0.5 bg-emerald-200 font-bold rounded text-emerald-900">
+                        IDENTIFIED
+                      </span>
+                      {detectedWarrantyStatus === 'UNDER_WARRANTY' ? (
+                        <span className="text-[9.5px] px-2 py-0.5 bg-emerald-700 text-white font-black rounded-full flex items-center gap-1 shadow-2xs">
+                          <ShieldCheck className="w-2.5 h-2.5" /> UNDER WARRANTY
+                        </span>
+                      ) : (
+                        <span className="text-[9.5px] px-2 py-0.5 bg-rose-600 text-white font-black rounded-full flex items-center gap-1 shadow-2xs">
+                          <ShieldX className="w-2.5 h-2.5" /> OUT OF WARRANTY
+                        </span>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>

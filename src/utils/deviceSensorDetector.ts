@@ -1,13 +1,12 @@
 /**
  * Auto Sensor Camera & Hardware Detector
- * Automatically senses and calibrates camera and barcode sensors for:
- * - Phone (Samsung, iPhone, Xiaomi, Pixel, OnePlus, etc.)
+ * Accurately detects and limits device classification to:
  * - PC / Laptop (Desktop, Mac, Windows, Linux webcams)
+ * - Phone / Mobile (Smartphones)
  * - Tablet (iPad, Android tablets)
- * - Hardware Laser Barcode Scanner (USB / Bluetooth HID gun sensors)
  */
 
-export type DeviceType = 'phone' | 'pc' | 'tablet' | 'scanner';
+export type DeviceType = 'pc' | 'phone' | 'tablet';
 
 export interface CameraSensorInfo {
   deviceId: string;
@@ -33,112 +32,103 @@ export interface AutoSensorCalibration {
 }
 
 /**
- * Probes browser User Agent, screen dimensions, and touch capabilities
- * to auto-detect whether the host is Phone, Tablet, PC, or using a Scanner.
+ * Cleanly probes browser User Agent, screen dimensions, and touch capabilities
+ * to classify the device into one of 3 clear types: PC, Phone, or Tablet.
  */
-export function detectDeviceHardware(): {
+export function detectDeviceHardware(manualOverride?: DeviceType): {
   deviceType: DeviceType;
   brand: string;
   model: string;
   displayName: string;
 } {
+  if (manualOverride) {
+    if (manualOverride === 'phone') {
+      return {
+        deviceType: 'phone',
+        brand: 'Phone',
+        model: 'Mobile',
+        displayName: 'Phone / Mobile',
+      };
+    }
+    if (manualOverride === 'tablet') {
+      return {
+        deviceType: 'tablet',
+        brand: 'Tablet',
+        model: 'Touch Tablet',
+        displayName: 'Tablet',
+      };
+    }
+    return {
+      deviceType: 'pc',
+      brand: 'PC',
+      model: 'Desktop / Laptop',
+      displayName: 'PC / Laptop',
+    };
+  }
+
   if (typeof window === 'undefined' || typeof navigator === 'undefined') {
     return {
       deviceType: 'pc',
       brand: 'PC',
-      model: 'Desktop',
-      displayName: 'PC / Desktop',
+      model: 'Desktop / Laptop',
+      displayName: 'PC / Laptop',
     };
   }
 
   const ua = (navigator.userAgent || '').toLowerCase();
   const maxTouchPoints = navigator.maxTouchPoints || 0;
-  const screenWidth = window.screen?.width || 1024;
-  const screenHeight = window.screen?.height || 768;
+  const screenWidth = window.screen?.width || (typeof window !== 'undefined' ? window.innerWidth : 1024);
+  const screenHeight = window.screen?.height || (typeof window !== 'undefined' ? window.innerHeight : 768);
   const minDim = Math.min(screenWidth, screenHeight);
 
-  // 1. Check Tablet (iPad, Android Tablet, Kindle, etc.)
+  // 1. Tablet Detection (iPad, Android Tablet, etc.)
   const isIPad = ua.includes('ipad') || (navigator.platform === 'MacIntel' && maxTouchPoints > 1);
   const isAndroidTablet = ua.includes('android') && !ua.includes('mobile');
   const isTabletUA = ua.includes('tablet') || ua.includes('playbook') || ua.includes('silk');
   const isTouchTabletDim = maxTouchPoints > 0 && minDim >= 600 && minDim <= 1024;
 
   if (isIPad || isAndroidTablet || isTabletUA || isTouchTabletDim) {
-    let tabletBrand = 'Tablet';
-    if (isIPad) tabletBrand = 'Apple iPad';
-    else if (ua.includes('samsung')) tabletBrand = 'Samsung Galaxy Tab';
-    else if (ua.includes('lenovo')) tabletBrand = 'Lenovo Tab';
-    else if (ua.includes('xiaomi') || ua.includes('redmi')) tabletBrand = 'Xiaomi Pad';
-
     return {
       deviceType: 'tablet',
-      brand: tabletBrand,
-      model: 'Touch Tablet',
-      displayName: `Tablet (${tabletBrand})`,
+      brand: 'Tablet',
+      model: isIPad ? 'iPad' : 'Android Tablet',
+      displayName: 'Tablet',
     };
   }
 
-  // 2. Check Phone (Smartphones)
+  // 2. Phone / Mobile Detection (Smartphones)
   const isMobileUA = ua.includes('mobile') || ua.includes('iphone') || ua.includes('ipod');
   const isSmallTouch = maxTouchPoints > 0 && minDim < 600;
 
   if (isMobileUA || isSmallTouch) {
-    let brand = 'Smartphone';
-    let model = 'Mobile Device';
-
-    if (ua.includes('samsung') || ua.includes('sm-') || ua.includes('sec-')) {
-      brand = 'Samsung';
-      model = 'Galaxy Series';
-    } else if (ua.includes('iphone')) {
-      brand = 'Apple';
-      model = 'iPhone';
-    } else if (ua.includes('redmi') || ua.includes('poco') || ua.includes('xiaomi') || ua.includes('mi ')) {
-      brand = 'Xiaomi';
-      model = 'Redmi / POCO';
-    } else if (ua.includes('pixel') || ua.includes('nexus')) {
-      brand = 'Google';
-      model = 'Pixel';
-    } else if (ua.includes('oneplus') || ua.includes('cph') || ua.includes('rmx') || ua.includes('oppo') || ua.includes('realme')) {
-      brand = 'OnePlus / Realme / Oppo';
-      model = 'Smartphone';
-    } else if (ua.includes('vivo') || ua.includes('iqoo')) {
-      brand = 'Vivo / iQOO';
-      model = 'Smartphone';
-    } else if (ua.includes('huawei') || ua.includes('honor')) {
-      brand = 'Huawei / Honor';
-      model = 'Smartphone';
-    }
-
     return {
       deviceType: 'phone',
-      brand,
-      model,
-      displayName: `Phone (${brand} ${model})`,
+      brand: 'Phone',
+      model: ua.includes('iphone') ? 'iPhone' : 'Mobile Smartphone',
+      displayName: 'Phone / Mobile',
     };
   }
 
-  // 3. Desktop / PC / Laptop
-  let pcBrand = 'PC / Laptop';
+  // 3. PC / Laptop / Desktop (Default)
+  let osLabel = 'Desktop / Laptop';
   if (ua.includes('macintosh') || ua.includes('mac os')) {
-    pcBrand = 'Apple Mac';
+    osLabel = 'Mac Computer';
   } else if (ua.includes('windows')) {
-    pcBrand = 'Windows PC';
-  } else if (ua.includes('cros')) {
-    pcBrand = 'Chromebook';
+    osLabel = 'Windows PC';
   } else if (ua.includes('linux')) {
-    pcBrand = 'Linux PC';
+    osLabel = 'Linux PC';
   }
 
   return {
     deviceType: 'pc',
-    brand: pcBrand,
-    model: 'Workstation',
-    displayName: `${pcBrand} (Desktop / Laptop)`,
+    brand: 'PC',
+    model: osLabel,
+    displayName: 'PC / Laptop',
   };
 }
 
 /**
- * Returns calibrated camera sensor and stream settings based on auto-sensed hardware
+ * Returns calibrated camera sensor and stream settings based on limited device hardware
  */
 export function getAutoSensorCalibration(
   deviceHardware: ReturnType<typeof detectDeviceHardware>,
@@ -146,62 +136,55 @@ export function getAutoSensorCalibration(
 ): AutoSensorCalibration {
   const { deviceType, brand, model, displayName } = deviceHardware;
 
-  // Find best sensor lens among detected cameras
-  const hasRearLens = detectedCameras.some((c) => c.isBackCamera);
-  const bestLens = hasRearLens || deviceType === 'phone' || deviceType === 'tablet' 
-    ? 'environment' 
-    : 'user';
-
-  if (deviceType === 'phone') {
-    const isPixel = brand.toLowerCase().includes('google');
+  // On PC / Desktop, prioritize webcam (user facing / default webcam)
+  if (deviceType === 'pc') {
     return {
-      deviceType: 'phone',
+      deviceType: 'pc',
       deviceBrand: brand,
       deviceModel: model,
       displayName,
-      recommendedSensor: 'environment',
-      sensorLabel: 'Rear High-Contrast Macro Sensor',
-      recommendedResolution: isPixel 
-        ? { width: 1920, height: 1080, label: '1080p FHD' } 
-        : { width: 1280, height: 720, label: '720p HD' },
-      aspectRatio: 1.333333, // 4:3 standard sensor aspect for retail barcodes
-      targetFps: isPixel ? 24 : 15,
-      focusMode: 'continuous',
-      summaryNote: 'Auto-calibrated for phone rear macro sensor with fast edge contrast sampling.',
+      recommendedSensor: 'user',
+      sensorLabel: 'PC Webcam / USB Camera',
+      recommendedResolution: { width: 1280, height: 720, label: '720p HD' },
+      aspectRatio: 1.777778, // 16:9 standard PC webcam
+      targetFps: 24,
+      focusMode: 'auto',
+      summaryNote: 'Directly opens PC built-in or USB webcam stream.',
       hardwareScannerReady: true,
     };
   }
 
   if (deviceType === 'tablet') {
+    const hasRearLens = detectedCameras.some((c) => c.isBackCamera);
     return {
       deviceType: 'tablet',
       deviceBrand: brand,
       deviceModel: model,
       displayName,
-      recommendedSensor: 'environment',
-      sensorLabel: 'Tablet Rear Wide-Sampling Lens',
+      recommendedSensor: hasRearLens ? 'environment' : 'environment',
+      sensorLabel: 'Tablet Camera',
       recommendedResolution: { width: 1280, height: 720, label: '720p HD' },
       aspectRatio: 1.333333,
-      targetFps: 15,
+      targetFps: 20,
       focusMode: 'continuous',
-      summaryNote: 'Auto-calibrated for tablet touch screen with balanced light sampling.',
+      summaryNote: 'Calibrated for tablet optical sensors.',
       hardwareScannerReady: true,
     };
   }
 
-  // PC / Laptop
+  // Phone / Mobile
   return {
-    deviceType: 'pc',
+    deviceType: 'phone',
     deviceBrand: brand,
     deviceModel: model,
     displayName,
-    recommendedSensor: bestLens,
-    sensorLabel: 'HD Web Camera / Desktop Optical Sensor',
-    recommendedResolution: { width: 1280, height: 720, label: '720p HD Web' },
-    aspectRatio: 1.777778, // 16:9 standard PC webcam
-    targetFps: 24,
-    focusMode: 'auto',
-    summaryNote: 'Auto-calibrated for desktop/laptop webcams with full-field barcode capture.',
+    recommendedSensor: 'environment',
+    sensorLabel: 'Phone Rear Camera',
+    recommendedResolution: { width: 1280, height: 720, label: '720p HD' },
+    aspectRatio: 1.333333, // 4:3
+    targetFps: 20,
+    focusMode: 'continuous',
+    summaryNote: 'Calibrated for phone rear macro camera sensor.',
     hardwareScannerReady: true,
   };
 }

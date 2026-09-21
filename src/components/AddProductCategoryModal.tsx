@@ -12,18 +12,51 @@ import {
   Check, 
   Package, 
   Layers,
-  Trash2
+  Trash2,
+  Camera,
+  CheckCircle2,
+  AlertCircle,
+  AlertTriangle,
+  XCircle,
+  Wand2,
+  RefreshCw,
+  Info
 } from 'lucide-react';
-import { InventoryItem, ProductCategory } from '../types';
+import { InventoryItem, ProductCategory, ActionLog, ActionCategory, LabelPrintReminder } from '../types';
 import { formatNPR } from '../utils/nepalLocale';
 import { useToast } from './Toast';
+import { BarcodeScannerModal } from './BarcodeScannerModal';
+import { ExistingProductMatchModal } from './ExistingProductMatchModal';
+import { 
+  generateUniqueSku, 
+  generateUniqueBarcode, 
+  validateSkuUniqueness,
+  validateSkuRealTime,
+  getSkuSuggestions,
+  isValidSkuPattern
+} from '../utils/skuGenerator';
+import { SkuLabelChecker } from './SkuLabelChecker';
 
 interface Props {
   isOpen: boolean;
   onClose: () => void;
   inventory: InventoryItem[];
   onAddProduct: (item: InventoryItem) => void;
+  onAddBatchProducts?: (items: InventoryItem[]) => void;
+  onUpdateProduct?: (item: InventoryItem) => void;
+  onOpenRestock?: (item: InventoryItem) => void;
+  onOpenReturn?: (item: InventoryItem) => void;
   onOpenScanner?: () => void;
+  onAddLabelReminder?: (reminder: Partial<LabelPrintReminder>) => void;
+  onLogAction?: (entry: {
+    category: ActionCategory;
+    actionTitle: string;
+    description: string;
+    staffName?: string;
+    source: ActionLog['source'];
+    status?: 'SUCCESS' | 'PENDING' | 'CANCELLED';
+    metadata?: Record<string, any>;
+  }) => void;
 }
 
 const DEFAULT_CATEGORIES: string[] = [
@@ -41,10 +74,24 @@ export function AddProductCategoryModal({
   onClose,
   inventory,
   onAddProduct,
+  onAddBatchProducts,
+  onUpdateProduct,
+  onOpenRestock,
+  onOpenReturn,
   onOpenScanner,
+  onAddLabelReminder,
+  onLogAction,
 }: Props) {
   const toast = useToast();
   const [activeTab, setActiveTab] = useState<'product' | 'categories'>('product');
+  const [showBarcodeScanner, setShowBarcodeScanner] = useState(false);
+  const [matchedProductPopup, setMatchedProductPopup] = useState<InventoryItem | null>(null);
+  const [matchedScanCode, setMatchedScanCode] = useState<string>('');
+
+  // Batch Item Tracking State
+  const [batchMode, setBatchMode] = useState(false);
+  const [batchQuantity, setBatchQuantity] = useState(5);
+  const [batchSkus, setBatchSkus] = useState<string[]>([]);
 
   // Dynamic Categories gathered from inventory + defaults
   const [customCategories, setCustomCategories] = useState<string[]>(() => {
@@ -83,16 +130,58 @@ export function AddProductCategoryModal({
   const profitPerUnit = sellNum - costNum;
   const marginPercent = sellNum > 0 ? (profitPerUnit / sellNum) * 100 : 0;
 
+  // Real-time SKU format and uniqueness validation
+  const skuValidation = useMemo(() => {
+    return validateSkuRealTime(sku, undefined, inventory);
+  }, [sku, inventory]);
+
+  // Suggested unique SKU presets based on brand, category, and name
+  const skuSuggestions = useMemo(() => {
+    return getSkuSuggestions(brand || 'Gadget', category, name || 'Item', inventory);
+  }, [brand, category, name, inventory]);
+
   // Auto-generate SKU & Barcode helper
   const handleAutoGenerateCodes = () => {
-    const brandPrefix = (brand.trim() || 'GAD').slice(0, 3).toUpperCase();
-    const namePrefix = (name.trim() || 'PROD').slice(0, 3).toUpperCase();
-    const randNum = Math.floor(1000 + Math.random() * 9000);
-    setSku(`${brandPrefix}-${namePrefix}-${randNum}`);
+    const genSku = generateUniqueSku(brand || 'Gadget', category, name || 'Item', inventory, { style: 'smart' });
+    setSku(genSku);
 
-    // Generate 12-digit UPC/EAN style barcode
-    const genBarcode = `890${Math.floor(100000000 + Math.random() * 900000000)}`;
+    // Generate unique EAN/UPC style barcode
+    const genBarcode = generateUniqueBarcode(inventory);
     setBarcode(genBarcode);
+    toast.success(`Generated unique SKU: ${genSku} & Barcode: ${genBarcode}`);
+  };
+
+  // Check QR or barcode with all inventory items, auto-fill, and ask restock/return popup
+  const handleCheckAndProcessBarcode = (scannedCode: string) => {
+    const clean = scannedCode.trim();
+    if (!clean) return;
+
+    const matched = inventory.find(
+      (i) =>
+        (i.barcode && i.barcode.trim().toLowerCase() === clean.toLowerCase()) ||
+        (i.sku && i.sku.trim().toLowerCase() === clean.toLowerCase())
+    );
+
+    if (matched) {
+      setName(matched.name);
+      setBrand(matched.brand);
+      setCategory(matched.category);
+      setCostPrice(matched.costPrice.toString());
+      setSellingPrice(matched.sellingPrice.toString());
+      setStockQuantity(matched.stockQuantity.toString());
+      setReorderLevel(matched.reorderLevel.toString());
+      setSupplier(matched.supplier || '');
+      setSku(matched.sku);
+      setBarcode(matched.barcode);
+      setImeiRequired(Boolean(matched.imeiRequired));
+
+      setMatchedScanCode(clean);
+      setMatchedProductPopup(matched);
+      toast.info(`Found existing item "${matched.name}". Details auto-filled.`, 'Catalog Match');
+    } else {
+      setBarcode(clean);
+      toast.success(`Barcode "${clean}" recorded.`, 'Barcode Scanned');
+    }
   };
 
   // Add Custom Category handler
@@ -112,6 +201,16 @@ export function AddProductCategoryModal({
     setCategory(trimmed);
     setNewCategoryInput('');
     toast.success(`Added new category "${trimmed}".`, 'Category Added');
+
+    if (onLogAction) {
+      onLogAction({
+        category: 'CATEGORY',
+        actionTitle: `Created Category: ${trimmed}`,
+        description: `Registered new product category "${trimmed}" in inventory catalog.`,
+        source: 'PRODUCT_MODAL',
+        metadata: { categoryName: trimmed },
+      });
+    }
   };
 
   // Submit Product Form
@@ -127,8 +226,70 @@ export function AddProductCategoryModal({
       return;
     }
 
-    const finalBarcode = barcode.trim() || `890${Math.floor(100000000 + Math.random() * 900000000)}`;
-    const finalSku = sku.trim() || `${brand.slice(0, 3).toUpperCase()}-${Math.floor(1000 + Math.random() * 9000)}`;
+    const finalBarcode = barcode.trim() || generateUniqueBarcode(inventory);
+
+    // BATCH MODE: Add multiple individual unit items of same product with same barcode
+    if (batchMode && batchSkus.length > 0) {
+      const existingSkuSet = new Set(inventory.map((i) => i.sku.trim().toLowerCase()));
+      for (const bSku of batchSkus) {
+        if (existingSkuSet.has(bSku.trim().toLowerCase())) {
+          toast.error(`Duplicate SKU in batch: "${bSku}". Please click Regenerate to get fresh unique SKUs.`, 'Duplicate SKU');
+          return;
+        }
+      }
+
+      const createdItems: InventoryItem[] = batchSkus.map((bSku, idx) => ({
+        id: `prod-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
+        sku: bSku.toUpperCase(),
+        barcode: finalBarcode,
+        name: name.trim(),
+        brand: brand.trim(),
+        category: category as ProductCategory,
+        costPrice: costNum,
+        sellingPrice: sellNum,
+        stockQuantity: 1, // each individual unit
+        reorderLevel: 1,
+        imeiRequired,
+        supplier: supplier.trim() || 'Wholesale Distributor',
+        lastRestockedDate: new Date().toISOString().split('T')[0],
+      }));
+
+      if (onAddBatchProducts) {
+        onAddBatchProducts(createdItems);
+      } else {
+        createdItems.forEach((item) => onAddProduct(item));
+      }
+
+      toast.success(
+        `Added batch of ${createdItems.length} units of "${createdItems[0]?.name}" with unique SKUs and shared barcode!`,
+        'Batch Registered'
+      );
+      onClose();
+      return;
+    }
+
+    // SINGLE ITEM MODE
+    const finalSku = (sku.trim() || generateUniqueSku(brand, category, name, inventory)).toUpperCase();
+
+    // Validate SKU uniqueness
+    const skuValidation = validateSkuUniqueness(finalSku, undefined, inventory);
+    if (!skuValidation.isValid) {
+      toast.error(skuValidation.error || 'Duplicate SKU detected!', 'SKU Conflict');
+      return;
+    }
+
+    // Shared barcode notification (same product model or batch)
+    if (finalBarcode) {
+      const duplicateBarcode = inventory.find(
+        (i) => i.barcode && i.barcode.toLowerCase() === finalBarcode.toLowerCase()
+      );
+      if (duplicateBarcode) {
+        toast.info(
+          `Product shares barcode "${finalBarcode}" with "${duplicateBarcode.name}". Unique SKU "${finalSku}" guarantees distinct inventory tracking.`,
+          'Shared Barcode'
+        );
+      }
+    }
 
     const newItem: InventoryItem = {
       id: `prod-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -147,7 +308,25 @@ export function AddProductCategoryModal({
     };
 
     onAddProduct(newItem);
-    toast.success(`Product "${newItem.name}" added to catalog & synchronized!`, 'Product Created');
+
+    // Auto-queue label printing & stickering reminder
+    if (onAddLabelReminder) {
+      onAddLabelReminder({
+        itemId: newItem.id,
+        itemName: newItem.name,
+        brand: newItem.brand,
+        category: newItem.category,
+        sku: newItem.sku,
+        barcode: newItem.barcode,
+        sellingPrice: newItem.sellingPrice,
+        costPrice: newItem.costPrice,
+        quantityNeeded: newItem.stockQuantity > 0 ? newItem.stockQuantity : 1,
+        source: 'NEW_PRODUCT',
+        status: 'PENDING',
+      });
+    }
+
+    toast.success(`Product "${newItem.name}" added! 🏷️ Labels queued for printing & stickering.`, 'Product Created');
     onClose();
   };
 
@@ -363,48 +542,100 @@ export function AddProductCategoryModal({
               </div>
 
               {/* SKU & Barcode Generator */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
-                <div>
-                  <div className="flex items-center justify-between mb-1">
-                    <label className="text-xs font-bold text-slate-700">SKU Code</label>
-                    <button
-                      type="button"
-                      onClick={handleAutoGenerateCodes}
-                      className="text-[11px] text-violet-600 hover:text-violet-800 font-bold flex items-center gap-1"
-                    >
-                      <Sparkles className="w-3 h-3" />
-                      <span>Auto-Generate</span>
-                    </button>
-                  </div>
-                  <input
-                    type="text"
-                    placeholder="e.g. APL-16PM-256-TI"
-                    value={sku}
-                    onChange={(e) => setSku(e.target.value)}
-                    className="w-full px-3 py-2 text-xs font-mono bg-white border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-violet-500"
-                  />
-                </div>
+              <div className="space-y-3 pt-1">
+                {/* SKU Code Input with Labeling Checker (Single & Batch Modes) */}
+                <SkuLabelChecker
+                  sku={sku}
+                  onChangeSku={setSku}
+                  barcode={barcode}
+                  brand={brand}
+                  category={category}
+                  name={name}
+                  inventory={inventory}
+                  batchMode={batchMode}
+                  onToggleBatchMode={setBatchMode}
+                  batchQuantity={batchQuantity}
+                  onChangeBatchQuantity={setBatchQuantity}
+                  batchSkus={batchSkus}
+                  onUpdateBatchSkus={setBatchSkus}
+                />
 
-                <div>
-                  <div className="flex items-center justify-between mb-1">
-                    <label className="text-xs font-bold text-slate-700">Barcode / EAN</label>
-                    {onOpenScanner && (
+                {/* Barcode / EAN Scanner Input */}
+                <div className="p-3.5 bg-slate-50/90 border border-slate-200 rounded-xl space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-bold text-slate-800">Barcode / EAN (Optical Code)</label>
+                    <div className="flex items-center gap-2">
                       <button
                         type="button"
-                        onClick={onOpenScanner}
-                        className="text-[11px] text-slate-600 hover:text-slate-900 font-semibold"
+                        onClick={() => setShowBarcodeScanner(true)}
+                        className="text-[11px] text-emerald-700 hover:text-emerald-800 font-semibold flex items-center gap-1 cursor-pointer"
                       >
-                        Scan Gun / Camera
+                        <Camera className="w-3.5 h-3.5" />
+                        <span>Scan Camera</span>
                       </button>
-                    )}
+                      {onOpenScanner && (
+                        <button
+                          type="button"
+                          onClick={onOpenScanner}
+                          className="text-[11px] text-slate-600 hover:text-slate-900 font-semibold"
+                        >
+                          Gun Scanner
+                        </button>
+                      )}
+                    </div>
                   </div>
-                  <input
-                    type="text"
-                    placeholder="e.g. 195949012345"
-                    value={barcode}
-                    onChange={(e) => setBarcode(e.target.value)}
-                    className="w-full px-3 py-2 text-xs font-mono bg-white border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-violet-500"
-                  />
+                  <div className="relative flex items-center">
+                    <input
+                      type="text"
+                      placeholder="e.g. 195949012345 (Enter to check catalog)"
+                      value={barcode}
+                      onChange={(e) => setBarcode(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          handleCheckAndProcessBarcode(barcode);
+                        }
+                      }}
+                      className="w-full px-3 py-2 pr-9 text-xs font-mono bg-white border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-violet-500"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowBarcodeScanner(true)}
+                      className="absolute right-2 p-1 text-slate-400 hover:text-emerald-700 transition-colors cursor-pointer"
+                      title="Scan barcode with camera"
+                    >
+                      <Camera className="w-4 h-4 text-emerald-700" />
+                    </button>
+                  </div>
+
+                  {/* Inline Notice if code matches an existing inventory item */}
+                  {(() => {
+                    const clean = barcode.trim();
+                    if (!clean) return null;
+                    const matched = inventory.find(
+                      (i) =>
+                        (i.barcode && i.barcode.toLowerCase() === clean.toLowerCase()) ||
+                        (i.sku && i.sku.toLowerCase() === clean.toLowerCase())
+                    );
+                    if (!matched) return null;
+                    return (
+                      <div className="mt-1.5 p-2 bg-emerald-50 border border-emerald-300 rounded-lg flex items-center justify-between gap-2 animate-fadeIn">
+                        <div className="text-[11px] text-emerald-950 flex items-center gap-1.5">
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                          <span>
+                            Catalog Match: <strong>{matched.name}</strong> ({matched.stockQuantity} in stock)
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleCheckAndProcessBarcode(matched.barcode || matched.sku)}
+                          className="px-2 py-0.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded text-[10px] font-bold shrink-0 transition-colors cursor-pointer"
+                        >
+                          Autofill & Options
+                        </button>
+                      </div>
+                    );
+                  })()}
                 </div>
               </div>
 
@@ -512,6 +743,56 @@ export function AddProductCategoryModal({
           </button>
         </div>
       </div>
+
+      {/* Barcode Camera Scanner Modal */}
+      {showBarcodeScanner && (
+        <BarcodeScannerModal
+          isOpen={showBarcodeScanner}
+          onClose={() => setShowBarcodeScanner(false)}
+          onBarcodeDetected={(scannedCode) => {
+            setShowBarcodeScanner(false);
+            handleCheckAndProcessBarcode(scannedCode);
+          }}
+          inventory={inventory}
+          title="Scan Product Barcode"
+          subtitle="Scan with camera to check catalog, autofill details, or register a new barcode"
+          zIndexClass="z-[75]"
+        />
+      )}
+
+      {/* Regarding Popup Modal when Scanned/Checked Barcode Matches Existing Item */}
+      {matchedProductPopup && (
+        <ExistingProductMatchModal
+          isOpen={Boolean(matchedProductPopup)}
+          onClose={() => setMatchedProductPopup(null)}
+          item={matchedProductPopup}
+          scannedCode={matchedScanCode}
+          onRestock={(qty) => {
+            if (onUpdateProduct) {
+              onUpdateProduct({
+                ...matchedProductPopup,
+                stockQuantity: matchedProductPopup.stockQuantity + qty,
+                lastRestockedDate: new Date().toISOString().split('T')[0],
+              });
+              toast.success(`Restocked +${qty} units of "${matchedProductPopup.name}".`);
+            }
+            onClose();
+          }}
+          onOpenFullRestock={() => {
+            setMatchedProductPopup(null);
+            onClose();
+            onOpenRestock?.(matchedProductPopup);
+          }}
+          onProcessReturn={() => {
+            setMatchedProductPopup(null);
+            onClose();
+            onOpenReturn?.(matchedProductPopup);
+          }}
+          onContinueEditing={() => {
+            setMatchedProductPopup(null);
+          }}
+        />
+      )}
     </div>
   );
 }

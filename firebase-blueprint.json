@@ -96,6 +96,23 @@
         "defaultTaxRate": { "type": "number", "description": "Default tax rate percentage" },
         "returnPolicyDays": { "type": "number", "description": "Warranty return window days" }
       }
+    },
+    "ActionLog": {
+      "collection": "action_logs",
+      "fields": {
+        "id": { "type": "string", "description": "Unique log entry ID" },
+        "timestamp": { "type": "string", "description": "ISO timestamp of action" },
+        "date": { "type": "string", "description": "YYYY-MM-DD" },
+        "time": { "type": "string", "description": "NPT formatted time string" },
+        "bsDate": { "type": "string", "description": "Bikram Sambat BS date" },
+        "category": { "type": "string", "description": "Action category classification" },
+        "actionTitle": { "type": "string", "description": "Short action title" },
+        "description": { "type": "string", "description": "Detailed description of action performed" },
+        "staffName": { "type": "string", "description": "Staff member or operator" },
+        "source": { "type": "string", "description": "UI component where action originated" },
+        "status": { "type": "string", "description": "SUCCESS, PENDING, CANCELLED" },
+        "metadata": { "type": "object", "description": "Additional context parameters (amounts, quantities, customer, IDs)" }
+      }
     }
   }
 }

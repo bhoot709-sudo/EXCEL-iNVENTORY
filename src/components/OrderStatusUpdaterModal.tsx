@@ -336,12 +336,12 @@ export function OrderStatusUpdaterModal({
               </p>
             </div>
           ) : (
-            filteredQueries.map((item) => {
+            filteredQueries.map((item, idx) => {
               const isEditing = editingQueryId === item.id;
 
               return (
                 <div
-                  key={item.id}
+                  key={`${item.id}-${idx}`}
                   className="p-4 bg-white border border-slate-200 rounded-xl shadow-2xs space-y-3 hover:border-slate-300 transition-all"
                 >
                   {/* Top Details */}

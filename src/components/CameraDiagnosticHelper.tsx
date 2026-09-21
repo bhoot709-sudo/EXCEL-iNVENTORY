@@ -12,9 +12,10 @@ import {
   HelpCircle,
   Lock,
   Globe,
-  Monitor
+  Monitor,
+  Tablet as TabletIcon
 } from 'lucide-react';
-import { detectPhoneProfile } from '../utils/phoneSpecsProfiles';
+import { detectDeviceHardware } from '../utils/deviceSensorDetector';
 
 export interface CameraDiagnosticReport {
   isSecureContext: boolean;
@@ -278,23 +279,36 @@ export function CameraDiagnosticHelper({
             </div>
           </div>
 
-          {/* Detected Phone Hardware Specs Profile Card */}
+          {/* Detected Device Hardware Profile Card */}
           {(() => {
-            const profile = detectPhoneProfile();
+            const hw = detectDeviceHardware();
+            const isPc = hw.deviceType === 'pc';
+            const isTablet = hw.deviceType === 'tablet';
+
             return (
               <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200 text-slate-800 text-xs flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
-                  <Smartphone className="w-4 h-4 text-emerald-600 shrink-0" />
+                  {isPc ? (
+                    <Monitor className="w-4 h-4 text-slate-700 shrink-0" />
+                  ) : isTablet ? (
+                    <TabletIcon className="w-4 h-4 text-emerald-600 shrink-0" />
+                  ) : (
+                    <Smartphone className="w-4 h-4 text-emerald-600 shrink-0" />
+                  )}
                   <div>
-                    <span className="font-bold text-slate-900">Detected Phone Hardware: </span>
-                    <span className="text-emerald-800 font-semibold">{profile.name}</span>
+                    <span className="font-bold text-slate-900">Detected Device: </span>
+                    <span className="text-emerald-800 font-semibold">{hw.displayName}</span>
                     <span className="text-[11px] text-slate-500 block">
-                      Recommended: {profile.recommendedResolution.height}p @ {profile.targetFps}fps • {profile.tuningNotes}
+                      {isPc 
+                        ? 'Camera Mode: PC Built-in or USB Webcam • 720p HD' 
+                        : isTablet 
+                        ? 'Camera Mode: Tablet Optical Sensor • 720p HD' 
+                        : 'Camera Mode: Smartphone Rear Lens & Native Camera App'}
                     </span>
                   </div>
                 </div>
                 <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 font-bold text-[10px] shrink-0">
-                  {profile.brand}
+                  {hw.brand}
                 </span>
               </div>
             );

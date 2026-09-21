@@ -1,4 +1,4 @@
-import { useState, useId, useEffect, useMemo } from 'react';
+import { useState, useId, useEffect, useMemo, useRef } from 'react';
 import { 
   Scan, 
   ShoppingCart, 
@@ -21,11 +21,23 @@ import {
   UserCheck,
   UserPlus,
   Gift,
-  Check
+  Check,
+  Zap,
+  Barcode,
+  CheckCircle2,
+  Volume2,
+  VolumeX,
+  RotateCcw,
+  Sparkles,
+  CornerDownLeft,
+  ScanLine,
+  SlidersHorizontal,
+  PackageCheck
 } from 'lucide-react';
 import { InventoryItem, CartItem, Invoice, ShopConfig, Customer } from '../types';
 import { useToast } from './Toast';
 import { formatNPR, formatNPTTime, toBikramSambat } from '../utils/nepalLocale';
+import { findItemByBarcodeOrSku, playScannerBeep, isAppGeneratedSkuFormat } from '../utils/barcodeUtils';
 
 interface Props {
   inventory: InventoryItem[];
@@ -41,6 +53,7 @@ interface Props {
   onOpenInvoice: (invoice: Invoice) => void;
   onAddCustomer?: (customer: Customer) => void;
   initialCartItemToAdd?: InventoryItem | null;
+  initialCartItemsToAdd?: Array<{ item: InventoryItem; quantity?: number }> | null;
   onClearInitialCartItemToAdd?: () => void;
 }
 
@@ -55,6 +68,7 @@ export function PosBillingView({
   onOpenInvoice,
   onAddCustomer,
   initialCartItemToAdd,
+  initialCartItemsToAdd,
   onClearInitialCartItemToAdd,
 }: Props) {
   const toast = useToast();
@@ -87,6 +101,165 @@ export function PosBillingView({
   const customerNameId = useId();
   const customerPhoneId = useId();
   const discountInputId = useId();
+
+  // Quick Scan State for instant SKU/Barcode checkout
+  const [quickScanInput, setQuickScanInput] = useState('');
+  const [isScanAutoAdd, setIsScanAutoAdd] = useState(true);
+  const [scannerSoundEnabled, setScannerSoundEnabled] = useState(true);
+  const [lastQuickScan, setLastQuickScan] = useState<{
+    item: InventoryItem | null;
+    code: string;
+    status: 'added' | 'incremented' | 'out_of_stock' | 'not_found';
+    timestamp: number;
+    newQty?: number;
+  } | null>(null);
+
+  const quickScanInputRef = useRef<HTMLInputElement | null>(null);
+  const quickScanInputId = useId();
+
+  // Live match preview while cashier types or partial scan is entered
+  const liveScanMatch = useMemo(() => {
+    const trimmed = quickScanInput.trim();
+    if (trimmed.length < 2) return null;
+    return findItemByBarcodeOrSku(inventory, trimmed);
+  }, [quickScanInput, inventory]);
+
+  // Execute quick scan and instant cart addition
+  const handleQuickScan = (codeOverride?: string) => {
+    const targetCode = (codeOverride !== undefined ? codeOverride : quickScanInput).trim();
+    if (!targetCode) return;
+
+    const matched = findItemByBarcodeOrSku(inventory, targetCode);
+
+    if (!matched) {
+      if (scannerSoundEnabled) {
+        playScannerBeep(true);
+      }
+      toast.error(`SKU / Barcode "${targetCode}" not found in inventory.`);
+      setLastQuickScan({
+        item: null,
+        code: targetCode,
+        status: 'not_found',
+        timestamp: Date.now(),
+      });
+      quickScanInputRef.current?.select();
+      return;
+    }
+
+    if (matched.stockQuantity <= 0) {
+      if (scannerSoundEnabled) {
+        playScannerBeep(true);
+      }
+      toast.warning(`Out of Stock: "${matched.name}" has 0 available inventory.`);
+      setLastQuickScan({
+        item: matched,
+        code: targetCode,
+        status: 'out_of_stock',
+        timestamp: Date.now(),
+      });
+      setQuickScanInput('');
+      quickScanInputRef.current?.focus();
+      return;
+    }
+
+    // Check cart quantity against available inventory
+    let wasIncremented = false;
+    let qtyInCart = 0;
+    const currentInCart = cart.find((c) => c.item.id === matched.id);
+    if (currentInCart) {
+      if (currentInCart.quantity >= matched.stockQuantity) {
+        if (scannerSoundEnabled) {
+          playScannerBeep(true);
+        }
+        toast.warning(`Cannot add more: All ${matched.stockQuantity} units of "${matched.name}" already in bill.`);
+        setLastQuickScan({
+          item: matched,
+          code: targetCode,
+          status: 'out_of_stock',
+          timestamp: Date.now(),
+          newQty: currentInCart.quantity,
+        });
+        setQuickScanInput('');
+        quickScanInputRef.current?.focus();
+        return;
+      }
+      wasIncremented = true;
+      qtyInCart = currentInCart.quantity + 1;
+    } else {
+      qtyInCart = 1;
+    }
+
+    // Add to cart
+    if (scannerSoundEnabled) {
+      playScannerBeep(false);
+    }
+    
+    addToCart(matched);
+    toast.success(`⚡ Quick-Scanned: "${matched.name}" (${formatNPR(matched.sellingPrice)}) added to bill.`);
+
+    setLastQuickScan({
+      item: matched,
+      code: targetCode,
+      status: wasIncremented ? 'incremented' : 'added',
+      timestamp: Date.now(),
+      newQty: qtyInCart,
+    });
+
+    setQuickScanInput('');
+    quickScanInputRef.current?.focus();
+  };
+
+  // Global Hardware Barcode Gun & F2 focus shortcut listener
+  useEffect(() => {
+    let keyBuffer = '';
+    let lastKeyTime = Date.now();
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // F2 hotkey: quickly focus Quick Scan box from anywhere in POS
+      if (e.key === 'F2') {
+        e.preventDefault();
+        quickScanInputRef.current?.focus();
+        quickScanInputRef.current?.select();
+        toast.info('⚡ Quick-Scan Barcode input focused (F2)');
+        return;
+      }
+
+      const activeTag = (document.activeElement as HTMLElement)?.tagName;
+      const isInput = activeTag === 'INPUT' || activeTag === 'TEXTAREA' || activeTag === 'SELECT';
+      const isQuickScanField = document.activeElement === quickScanInputRef.current;
+
+      // When Enter is pressed (typical barcode scanners append Enter)
+      if (e.key === 'Enter') {
+        if (keyBuffer.length >= 3) {
+          const timeSpan = Date.now() - lastKeyTime;
+          // If rapid burst typing or user wasn't in a customer form field
+          if (timeSpan < 250 || !isInput || isQuickScanField) {
+            e.preventDefault();
+            const scannedBarcode = keyBuffer.trim();
+            keyBuffer = '';
+            handleQuickScan(scannedBarcode);
+            return;
+          }
+        }
+        keyBuffer = '';
+        return;
+      }
+
+      // If single printable character
+      if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const now = Date.now();
+        // Reset buffer if delay > 120ms (manual human typing outside scanner)
+        if (now - lastKeyTime > 120) {
+          keyBuffer = '';
+        }
+        lastKeyTime = now;
+        keyBuffer += e.key;
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [inventory, cart, scannerSoundEnabled]);
 
   // If preselectedCustomerId changes or is passed, pick that customer
   useEffect(() => {
@@ -127,23 +300,54 @@ export function PosBillingView({
     }
   };
 
-  // Matching customers for picker
-  const matchingCustomers = customerSearchInput.trim()
-    ? customers.filter(
-        (c) =>
-          c.name.toLowerCase().includes(customerSearchInput.toLowerCase()) ||
-          c.phone.includes(customerSearchInput) ||
-          (c.email && c.email.toLowerCase().includes(customerSearchInput.toLowerCase()))
-      )
-    : customers.slice(0, 6);
+  // Matching customers for picker (memoized to avoid re-scanning list during render)
+  const matchingCustomers = useMemo(() => {
+    const term = customerSearchInput.trim().toLowerCase();
+    if (!term) return customers.slice(0, 6);
+    return customers.filter(
+      (c) =>
+        c.name.toLowerCase().includes(term) ||
+        c.phone.includes(term) ||
+        (c.email && c.email.toLowerCase().includes(term))
+    );
+  }, [customers, customerSearchInput]);
 
-  // If initialCartItemToAdd is passed from scan dashboard, auto-add to cart
+  // If initialCartItemToAdd or initialCartItemsToAdd is passed, auto-add to cart
   useEffect(() => {
-    if (initialCartItemToAdd) {
+    if (initialCartItemsToAdd && initialCartItemsToAdd.length > 0) {
+      setCart((prev) => {
+        let nextCart = [...prev];
+        for (const entry of initialCartItemsToAdd) {
+          const { item, quantity = 1 } = entry;
+          if (item.stockQuantity <= 0) continue;
+          const existingIndex = nextCart.findIndex((c) => c.item.id === item.id);
+          if (existingIndex >= 0) {
+            const currentQty = nextCart[existingIndex].quantity;
+            const newQty = Math.min(currentQty + quantity, item.stockQuantity);
+            nextCart[existingIndex] = {
+              ...nextCart[existingIndex],
+              quantity: newQty,
+            };
+          } else {
+            const safeQty = Math.min(quantity, item.stockQuantity);
+            if (safeQty > 0) {
+              nextCart.push({
+                item,
+                quantity: safeQty,
+                unitDiscount: 0,
+                selectedImeis: [],
+              });
+            }
+          }
+        }
+        return nextCart;
+      });
+      onClearInitialCartItemToAdd?.();
+    } else if (initialCartItemToAdd) {
       addToCart(initialCartItemToAdd);
       onClearInitialCartItemToAdd?.();
     }
-  }, [initialCartItemToAdd, onClearInitialCartItemToAdd]);
+  }, [initialCartItemToAdd, initialCartItemsToAdd, onClearInitialCartItemToAdd]);
 
   // Points redemption calculation: 1 loyalty point = रु 10 discount
   const maxRedeemablePoints = selectedCustomer 
@@ -164,11 +368,16 @@ export function PosBillingView({
       return;
     }
 
+    const currentItem = cart.find((c) => c.item.id === item.id);
+    if (currentItem && currentItem.quantity >= item.stockQuantity) {
+      toast.warning(`Cannot add more: only ${item.stockQuantity} units available in stock.`);
+      return;
+    }
+
     setCart((prev) => {
       const existing = prev.find((c) => c.item.id === item.id);
       if (existing) {
         if (existing.quantity >= item.stockQuantity) {
-          toast.warning(`Cannot add more: only ${item.stockQuantity} units available in stock.`);
           return prev;
         }
         return prev.map((c) =>
@@ -390,19 +599,23 @@ export function PosBillingView({
     }
   };
 
-  // Filter items
-  const filteredItems = inventory.filter((item) => {
-    const matchesSearch =
-      item.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      item.barcode.includes(searchQuery) ||
-      item.brand.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      item.sku.toLowerCase().includes(searchQuery.toLowerCase());
+  // Filter items (memoized with lowercased search term for instant responsiveness)
+  const filteredItems = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    return inventory.filter((item) => {
+      const matchesSearch =
+        !q ||
+        item.name.toLowerCase().includes(q) ||
+        item.barcode.includes(q) ||
+        item.brand.toLowerCase().includes(q) ||
+        item.sku.toLowerCase().includes(q);
 
-    const matchesCategory =
-      selectedCategory === 'All' || item.category === selectedCategory;
+      const matchesCategory =
+        selectedCategory === 'All' || item.category === selectedCategory;
 
-    return matchesSearch && matchesCategory;
-  });
+      return matchesSearch && matchesCategory;
+    });
+  }, [inventory, searchQuery, selectedCategory]);
 
   const categories = useMemo(() => {
     const defaults = ['All', 'Smartphones', 'Tablets', 'Wearables', 'Audio', 'Chargers & Power', 'Protection & Cases', 'Cables & Adapters'];
@@ -413,30 +626,241 @@ export function PosBillingView({
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
       {/* LEFT: Product Catalog & Barcode Fast Search (7 cols) */}
-      <div className="lg:col-span-7 space-y-4">
-        {/* Search & Barcode Scan Bar */}
-        <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs flex flex-col sm:flex-row gap-3 items-center">
+      <div className="lg:col-span-7 space-y-3.5">
+        {/* ⚡ High-Speed Quick Scan & Instant Cart Addition Card */}
+        <div className="p-4 bg-gradient-to-br from-slate-900 via-slate-800 to-emerald-950 text-white rounded-2xl shadow-md border border-emerald-500/30 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <div className="p-1.5 rounded-lg bg-emerald-500/20 text-emerald-400 ring-1 ring-emerald-500/40">
+                <Zap className="w-4 h-4 fill-emerald-400 text-emerald-400 animate-pulse" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <h3 className="text-xs font-bold tracking-wide text-white uppercase flex items-center gap-1.5">
+                    <span>Quick Scan & Instant Add</span>
+                    <span className="text-[10px] text-emerald-300 font-normal font-sans">(द्रुत स्क्यान)</span>
+                  </h3>
+                  <span className="hidden sm:inline-block px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 text-[10px] font-mono font-semibold border border-emerald-500/30">
+                    Press F2 to Focus
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-300">
+                  Scan SKU or barcode with laser gun or type + Enter to add directly to cart
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-1.5">
+              {/* Sound toggle button */}
+              <button
+                type="button"
+                onClick={() => {
+                  setScannerSoundEnabled(!scannerSoundEnabled);
+                  toast.info(scannerSoundEnabled ? 'Scanner sound muted' : 'Scanner audio beeps enabled');
+                }}
+                className={`p-1.5 rounded-lg text-xs transition-colors cursor-pointer border ${
+                  scannerSoundEnabled 
+                    ? 'bg-slate-700/70 border-slate-600 text-emerald-300 hover:bg-slate-700' 
+                    : 'bg-slate-800/80 border-slate-700 text-slate-400 hover:text-slate-200'
+                }`}
+                title={scannerSoundEnabled ? 'Audio Chime Enabled (Click to mute)' : 'Audio Chime Muted (Click to enable)'}
+              >
+                {scannerSoundEnabled ? <Volume2 className="w-3.5 h-3.5" /> : <VolumeX className="w-3.5 h-3.5" />}
+              </button>
+
+              {/* Camera Scanner button */}
+              <button
+                type="button"
+                onClick={onOpenScanner}
+                className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors shadow-xs cursor-pointer"
+                title="Open Camera Barcode Scanner"
+              >
+                <Scan className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Camera</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Quick Scan Input Bar */}
+          <div className="space-y-1.5">
+            <div className="relative flex items-center">
+              <Barcode className="w-4 h-4 text-emerald-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <input
+                ref={quickScanInputRef}
+                id={quickScanInputId}
+                type="text"
+                value={quickScanInput}
+                onChange={(e) => setQuickScanInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    handleQuickScan();
+                  }
+                }}
+                placeholder="Scan or enter SKU / Barcode (e.g. APL-16PM-256-TI or 0192837465)..."
+                className="w-full pl-9 pr-24 py-2 bg-slate-950/80 border border-emerald-500/40 focus:border-emerald-400 rounded-xl text-xs font-mono text-emerald-100 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 transition-all shadow-inner"
+                autoComplete="off"
+                spellCheck="false"
+              />
+              <button
+                type="button"
+                onClick={() => handleQuickScan()}
+                disabled={!quickScanInput.trim()}
+                className="absolute right-1 px-3 py-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:hover:bg-emerald-600 text-white rounded-lg text-xs font-bold flex items-center gap-1 transition-all cursor-pointer shadow-xs"
+              >
+                <span>Add</span>
+                <CornerDownLeft className="w-3 h-3" />
+              </button>
+            </div>
+
+            {/* Live Autocomplete / Matching Preview */}
+            {liveScanMatch && (
+              <div className="p-2 rounded-lg bg-slate-950/90 border border-emerald-500/50 flex items-center justify-between text-xs animate-fadeIn">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
+                  <div className="truncate">
+                    <span className="font-bold text-white">{liveScanMatch.name}</span>
+                    <span className="text-slate-400 text-[11px] ml-1.5 font-mono font-medium">
+                      SKU: {liveScanMatch.sku} • Stock: {liveScanMatch.stockQuantity}
+                    </span>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="font-mono font-bold text-emerald-300 text-xs">
+                    {formatNPR(liveScanMatch.sellingPrice)}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => handleQuickScan(liveScanMatch.sku || liveScanMatch.barcode)}
+                    className="px-2 py-0.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded text-[11px] font-extrabold cursor-pointer transition-colors"
+                  >
+                    ↵ Add to Cart
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Last Quick Scan Status Banner (Visual Feedback for Cashier) */}
+          {lastQuickScan && (
+            <div
+              className={`p-2.5 rounded-xl border text-xs animate-fadeIn transition-all ${
+                lastQuickScan.status === 'added' || lastQuickScan.status === 'incremented'
+                  ? 'bg-emerald-950/80 border-emerald-500/60 text-emerald-100'
+                  : lastQuickScan.status === 'out_of_stock'
+                    ? 'bg-amber-950/80 border-amber-500/60 text-amber-100'
+                    : 'bg-rose-950/80 border-rose-500/60 text-rose-100'
+              }`}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  {lastQuickScan.status === 'added' || lastQuickScan.status === 'incremented' ? (
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  ) : lastQuickScan.status === 'out_of_stock' ? (
+                    <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                  ) : (
+                    <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                  )}
+
+                  <div className="min-w-0">
+                    {lastQuickScan.item ? (
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="font-bold text-white truncate">{lastQuickScan.item.name}</span>
+                        <span className="font-mono font-semibold text-emerald-300 text-[11px]">
+                          {formatNPR(lastQuickScan.item.sellingPrice)}
+                        </span>
+                        <span className="px-1.5 py-0.2 rounded bg-slate-800 text-[10px] text-slate-300 font-mono">
+                          {lastQuickScan.status === 'incremented' ? `Qty in Bill: ${lastQuickScan.newQty}` : 'Added 1 unit'}
+                        </span>
+                      </div>
+                    ) : (
+                      <div>
+                        <span className="font-bold text-rose-300">Code Not Found: </span>
+                        <span className="font-mono text-slate-200">"{lastQuickScan.code}"</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Inline Quick Adjustment Actions */}
+                {lastQuickScan.item && (lastQuickScan.status === 'added' || lastQuickScan.status === 'incremented') && (
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => handleQuickScan(lastQuickScan.item?.sku || lastQuickScan.item?.barcode)}
+                      className="px-2 py-0.5 bg-emerald-500/30 hover:bg-emerald-500/50 border border-emerald-400/40 text-emerald-200 rounded text-[10px] font-bold cursor-pointer transition-colors"
+                      title="Add another unit"
+                    >
+                      +1 More
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!lastQuickScan.item) return;
+                        const currentInCart = cart.find((c) => c.item.id === lastQuickScan.item?.id);
+                        if (currentInCart) {
+                          updateQuantity(lastQuickScan.item.id, currentInCart.quantity - 1);
+                          toast.info(`Updated "${lastQuickScan.item.name}" quantity`);
+                        }
+                      }}
+                      className="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 rounded text-[10px] font-bold cursor-pointer transition-colors"
+                      title="Reduce 1 unit"
+                    >
+                      -1 Less
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!lastQuickScan.item) return;
+                        removeFromCart(lastQuickScan.item.id);
+                        toast.info(`Removed "${lastQuickScan.item.name}" from bill`);
+                        setLastQuickScan(null);
+                      }}
+                      className="px-2 py-0.5 bg-rose-900/60 hover:bg-rose-800/80 border border-rose-600/60 text-rose-200 rounded text-[10px] font-bold cursor-pointer transition-colors"
+                      title="Undo: Remove item completely from cart"
+                    >
+                      Undo
+                    </button>
+                  </div>
+                )}
+
+                {lastQuickScan.status === 'not_found' && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearchQuery(lastQuickScan.code);
+                      setLastQuickScan(null);
+                    }}
+                    className="px-2 py-0.5 bg-rose-800/60 hover:bg-rose-700 border border-rose-500 text-rose-100 rounded text-[10px] font-bold cursor-pointer transition-colors shrink-0"
+                  >
+                    Search in Catalog
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Product Catalog Search & Category Filters */}
+        <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-xs flex flex-col sm:flex-row gap-2.5 items-center">
           <div className="relative flex-1 w-full">
             <label htmlFor={searchInputId} className="sr-only">Search phones, gadgets, barcodes or SKUs</label>
-            <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
             <input
               id={searchInputId}
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search phones, gadgets, barcode (EAN/UPC) or SKU..."
-              className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:bg-white transition-all"
+              placeholder="Search catalog by name, brand, model or category..."
+              className="w-full pl-9 pr-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:bg-white transition-all"
             />
           </div>
 
-          <button
-            id="pos-open-scanner-btn"
-            onClick={onOpenScanner}
-            className="w-full sm:w-auto px-4 py-2.5 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition-colors shadow-xs shrink-0"
-          >
-            <Scan className="w-4 h-4 text-emerald-400" />
-            <span>Scan Barcode</span>
-          </button>
+          <div className="flex items-center gap-1.5 w-full sm:w-auto justify-between sm:justify-end">
+            <span className="text-[11px] font-medium text-slate-500 font-mono-num">
+              {filteredItems.length} items
+            </span>
+          </div>
         </div>
 
         {/* Category Pills */}
@@ -458,7 +882,7 @@ export function PosBillingView({
 
         {/* Product Catalog Cards */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[620px] overflow-y-auto pr-1">
-          {filteredItems.map((item) => {
+          {filteredItems.map((item, idx) => {
             const isLow = item.stockQuantity <= item.reorderLevel;
             const isOut = item.stockQuantity <= 0;
             const profit = item.sellingPrice - item.costPrice;
@@ -466,7 +890,7 @@ export function PosBillingView({
 
             return (
               <div
-                key={item.id}
+                key={`${item.id}-${item.sku || 'sku'}-${idx}`}
                 className={`p-3.5 bg-white rounded-2xl border transition-all flex flex-col justify-between ${
                   isOut
                     ? 'border-slate-200 opacity-60'

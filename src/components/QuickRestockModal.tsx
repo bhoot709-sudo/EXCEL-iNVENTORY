@@ -196,13 +196,13 @@ export function QuickRestockModal({
                   </p>
                 </div>
               ) : (
-                displayedItems.map((item) => {
+                displayedItems.map((item, idx) => {
                   const isSelected = activeItem?.id === item.id;
                   const isLow = item.stockQuantity <= item.reorderLevel;
 
                   return (
                     <button
-                      key={item.id}
+                      key={`${item.id}-${item.sku || 'sku'}-${idx}`}
                       type="button"
                       onClick={() => handleSelectItem(item)}
                       className={`w-full text-left p-3 rounded-xl transition-all flex items-center justify-between gap-3 ${

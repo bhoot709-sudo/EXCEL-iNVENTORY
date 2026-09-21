@@ -7,10 +7,17 @@ import {
   Check, 
   AlertTriangle, 
   Calculator,
-  RefreshCw
+  RefreshCw,
+  RotateCcw,
+  Receipt,
+  TrendingUp,
+  Package,
+  Link as LinkIcon
 } from 'lucide-react';
 import { InventoryItem, Invoice, ReturnedProduct, ShopConfig } from '../types';
 import { exportToExcelWorkbook } from '../utils/excelEngine';
+import { formatNPR } from '../utils/nepalLocale';
+import { ReturnsWarrantySpreadsheet } from './ReturnsWarrantySpreadsheet';
 
 interface Props {
   inventory: InventoryItem[];
@@ -20,6 +27,11 @@ interface Props {
   onUpdateItem: (updated: InventoryItem) => void;
   onAddItem: () => void;
   onImportClick: () => void;
+  onOpenInvoice?: (inv: Invoice) => void;
+  onAddReturn?: (newReturn: ReturnedProduct, shouldRestock: boolean, itemId?: string) => void;
+  onUpdateReturn?: (updated: ReturnedProduct) => void;
+  onDeleteReturn?: (returnId: string) => void;
+  initialSheet?: 'inventory' | 'sales' | 'returns' | 'monthly';
 }
 
 export function ExcelGridView({
@@ -30,8 +42,13 @@ export function ExcelGridView({
   onUpdateItem,
   onAddItem,
   onImportClick,
+  onOpenInvoice,
+  onAddReturn,
+  onUpdateReturn,
+  onDeleteReturn,
+  initialSheet = 'inventory',
 }: Props) {
-  const [activeSheet, setActiveSheet] = useState<'inventory' | 'sales' | 'returns' | 'monthly'>('inventory');
+  const [activeSheet, setActiveSheet] = useState<'inventory' | 'sales' | 'returns' | 'monthly'>(initialSheet);
   const [selectedCell, setSelectedCell] = useState<{ row: number; col: string; field: string; itemId: string } | null>({
     row: 2,
     col: 'J',
@@ -115,69 +132,140 @@ export function ExcelGridView({
   return (
     <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden flex flex-col">
       {/* Excel Ribbon Toolbar */}
-      <div className="bg-slate-50 border-b border-slate-200 px-4 py-2.5 flex flex-wrap items-center justify-between gap-3">
+      <div className="bg-slate-900 text-white px-4 py-2.5 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
-          <div className="flex items-center gap-1.5 px-2.5 py-1 bg-emerald-700 text-white rounded-lg text-xs font-bold shadow-xs">
+          <div className="flex items-center gap-1.5 px-2.5 py-1 bg-emerald-600 text-white rounded-lg text-xs font-bold shadow-xs">
             <FileSpreadsheet className="w-4 h-4" />
             <span>Excel Workbook Engine</span>
           </div>
-          <span className="text-xs text-slate-500 hidden sm:inline">
-            Phone & Gadget Inventory Spreadsheet (Live Formula Calculation)
+          <span className="text-xs text-slate-300 hidden sm:inline">
+            Phone & Gadget Inventory Spreadsheet (Live Multi-Sheet Workbook)
           </span>
         </div>
 
         <div className="flex items-center gap-2">
           <button
             onClick={() => exportToExcelWorkbook(inventory, invoices, returns, shopConfig)}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors"
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors"
             title="Download genuine .xlsx spreadsheet with formulas"
           >
             <Download className="w-3.5 h-3.5" />
             <span>Export to Excel (.xlsx)</span>
           </button>
 
-          <button
-            onClick={onImportClick}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 rounded-lg text-xs font-medium transition-colors"
-            title="Upload existing Excel or CSV file"
-          >
-            <Upload className="w-3.5 h-3.5 text-slate-500" />
-            <span className="hidden sm:inline">Import .xlsx</span>
-          </button>
+          {activeSheet === 'inventory' && (
+            <>
+              <button
+                onClick={onImportClick}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-800 border border-slate-700 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-medium transition-colors"
+                title="Upload existing Excel or CSV file"
+              >
+                <Upload className="w-3.5 h-3.5 text-slate-400" />
+                <span className="hidden sm:inline">Import .xlsx</span>
+              </button>
 
-          <button
-            onClick={onAddItem}
-            className="flex items-center gap-1 px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-white rounded-lg text-xs font-medium transition-colors"
-          >
-            <Plus className="w-3.5 h-3.5" />
-            <span>Add Row</span>
-          </button>
+              <button
+                onClick={onAddItem}
+                className="flex items-center gap-1 px-3 py-1.5 bg-white text-slate-900 hover:bg-slate-100 rounded-lg text-xs font-bold transition-colors"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Add Item</span>
+              </button>
+            </>
+          )}
         </div>
       </div>
 
-      {/* Formula Bar */}
-      <div className="bg-white border-b border-slate-200 px-3 py-1.5 flex items-center gap-2 text-xs">
-        <div className="w-16 px-2 py-1 bg-slate-100 border border-slate-300 rounded font-mono-num font-bold text-center text-slate-700">
-          {selectedCell ? `${selectedCell.col}${selectedCell.row}` : 'A1'}
+      {/* Top Sheet Switcher Bar */}
+      <div className="bg-slate-100 border-b border-slate-200 px-3 py-1.5 flex items-center justify-between gap-2 overflow-x-auto">
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={() => setActiveSheet('inventory')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all ${
+              activeSheet === 'inventory'
+                ? 'bg-white text-emerald-800 shadow-xs border border-slate-200'
+                : 'text-slate-600 hover:bg-slate-200/70 hover:text-slate-900'
+            }`}
+          >
+            <Package className="w-3.5 h-3.5 text-emerald-600" />
+            <span>Sheet 1: Master Inventory ({inventory.length})</span>
+          </button>
+
+          <button
+            onClick={() => setActiveSheet('sales')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all ${
+              activeSheet === 'sales'
+                ? 'bg-white text-emerald-800 shadow-xs border border-slate-200'
+                : 'text-slate-600 hover:bg-slate-200/70 hover:text-slate-900'
+            }`}
+          >
+            <Receipt className="w-3.5 h-3.5 text-blue-600" />
+            <span>Sheet 2: Sales Transactions ({invoices.length})</span>
+          </button>
+
+          <button
+            onClick={() => setActiveSheet('returns')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all ${
+              activeSheet === 'returns'
+                ? 'bg-rose-700 text-white shadow-xs'
+                : 'text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200'
+            }`}
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span>Sheet 3: Returns & Warranty ({returns.length})</span>
+            <span className={`text-[10px] px-1.5 py-0.2 rounded-full font-bold ${
+              activeSheet === 'returns' ? 'bg-white text-rose-800' : 'bg-rose-200 text-rose-900'
+            }`}>
+              Active Module
+            </span>
+          </button>
+
+          <button
+            onClick={() => setActiveSheet('monthly')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all ${
+              activeSheet === 'monthly'
+                ? 'bg-white text-emerald-800 shadow-xs border border-slate-200'
+                : 'text-slate-600 hover:bg-slate-200/70 hover:text-slate-900'
+            }`}
+          >
+            <TrendingUp className="w-3.5 h-3.5 text-purple-600" />
+            <span>Sheet 4: Monthly Analysis</span>
+          </button>
         </div>
-        <div className="flex items-center gap-1 text-slate-400 font-bold px-1 select-none">
-          <Calculator className="w-3.5 h-3.5 text-emerald-600" />
-          <span>fx</span>
+
+        <div className="text-[11px] text-slate-500 font-medium hidden lg:flex items-center gap-2">
+          <span>Active Sheet: <strong className="text-slate-800">{activeSheet.toUpperCase()}</strong></span>
+          <span>•</span>
+          <span className="text-emerald-700 font-semibold">Live Formulas Active</span>
         </div>
-        <div className="flex-1 px-2 py-1 bg-slate-50 border border-slate-200 rounded font-mono-num text-slate-800 truncate">
-          {getFormulaBarText()}
-        </div>
-        <span className="text-[11px] text-slate-400 hidden lg:inline">
-          💡 Double-click any Price or Stock cell to edit directly in spreadsheet
-        </span>
       </div>
 
-      {/* Spreadsheet Grid Content */}
-      <div className="overflow-x-auto max-h-[600px] scrollbar-thin">
-        <table className="w-full text-left border-collapse select-none">
-          {/* Column Letters Header (Excel style: A, B, C, D...) */}
-          <thead>
-            <tr className="bg-slate-100 text-slate-500 text-[11px] font-semibold border-b border-slate-300">
+      {/* SHEET 1: MASTER INVENTORY */}
+      {activeSheet === 'inventory' && (
+        <>
+          {/* Formula Bar */}
+          <div className="bg-white border-b border-slate-200 px-3 py-1.5 flex items-center gap-2 text-xs">
+            <div className="w-16 px-2 py-1 bg-slate-100 border border-slate-300 rounded font-mono-num font-bold text-center text-slate-700">
+              {selectedCell ? `${selectedCell.col}${selectedCell.row}` : 'A1'}
+            </div>
+            <div className="flex items-center gap-1 text-slate-400 font-bold px-1 select-none">
+              <Calculator className="w-3.5 h-3.5 text-emerald-600" />
+              <span>fx</span>
+            </div>
+            <div className="flex-1 px-2 py-1 bg-slate-50 border border-slate-200 rounded font-mono-num text-slate-800 truncate">
+              {getFormulaBarText()}
+            </div>
+            <span className="text-[11px] text-slate-400 hidden lg:inline">
+              💡 Double-click any Price or Stock cell to edit directly in spreadsheet
+            </span>
+          </div>
+
+          {/* Spreadsheet Grid Content */}
+          <div className="overflow-x-auto max-h-[600px] scrollbar-thin">
+            <table className="w-full text-left border-collapse select-none">
+              {/* Column Letters Header (Excel style: A, B, C, D...) */}
+              <thead>
+                <tr className="bg-slate-100 text-slate-500 text-[11px] font-semibold border-b border-slate-300">
               <th className="w-10 p-1.5 text-center border-r border-slate-300 bg-slate-200/70">#</th>
               <th className="p-2 border-r border-slate-200 min-w-[140px]">A • SKU</th>
               <th className="p-2 border-r border-slate-200 min-w-[130px]">B • Barcode</th>
@@ -211,7 +299,7 @@ export function ExcelGridView({
 
               return (
                 <tr
-                  key={item.id}
+                  key={`${item.id}-${item.sku || 'sku'}-${index}`}
                   className={`hover:bg-slate-50 transition-colors ${
                     isOutOfStock
                       ? 'bg-rose-50/50'
@@ -486,6 +574,119 @@ export function ExcelGridView({
           </tfoot>
         </table>
       </div>
+      </>
+      )}
+
+      {/* SHEET 2: SALES TRANSACTIONS */}
+      {activeSheet === 'sales' && (
+        <div className="overflow-x-auto max-h-[600px] scrollbar-thin">
+          <table className="w-full text-left border-collapse text-xs select-none">
+            <thead>
+              <tr className="bg-slate-100 text-slate-500 text-[11px] font-semibold border-b border-slate-300">
+                <th className="w-10 p-1.5 text-center border-r border-slate-300 bg-slate-200/70">#</th>
+                <th className="p-2 border-r border-slate-200 min-w-[150px]">A • Invoice #</th>
+                <th className="p-2 border-r border-slate-200 min-w-[120px]">B • Date</th>
+                <th className="p-2 border-r border-slate-200 min-w-[160px]">C • Customer</th>
+                <th className="p-2 border-r border-slate-200 min-w-[120px]">D • Phone</th>
+                <th className="p-2 border-r border-slate-200 min-w-[220px]">E • Items Sold</th>
+                <th className="p-2 border-r border-slate-200 text-right min-w-[110px]">F • Subtotal</th>
+                <th className="p-2 border-r border-slate-200 text-right min-w-[110px]">G • VAT / Tax</th>
+                <th className="p-2 border-r border-slate-200 text-right min-w-[120px] font-bold text-slate-900">H • Grand Total</th>
+                <th className="p-2 border-r border-slate-200 text-right min-w-[110px] text-blue-900 font-bold">I • Profit</th>
+                <th className="p-2 border-r border-slate-200 min-w-[110px]">J • Payment</th>
+                <th className="p-2 min-w-[100px] text-center">Action</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-200">
+              {invoices.length === 0 ? (
+                <tr>
+                  <td colSpan={12} className="p-8 text-center text-slate-400">
+                    No sales invoices recorded yet.
+                  </td>
+                </tr>
+              ) : (
+                invoices.map((inv, idx) => (
+                  <tr key={inv.id} className="hover:bg-slate-50 transition-colors">
+                    <td className="p-2 text-center text-slate-400 bg-slate-50 font-mono text-[11px]">{idx + 2}</td>
+                    <td className="p-2 border-r border-slate-200 font-bold text-slate-900 font-mono">{inv.invoiceNumber}</td>
+                    <td className="p-2 border-r border-slate-200 text-slate-600">{inv.date}</td>
+                    <td className="p-2 border-r border-slate-200 font-medium text-slate-900">{inv.customerName}</td>
+                    <td className="p-2 border-r border-slate-200 font-mono text-slate-600">{inv.customerPhone}</td>
+                    <td className="p-2 border-r border-slate-200 text-slate-700 truncate max-w-[240px]" title={inv.items.map(i => i.name).join(', ')}>
+                      {inv.items.map(i => `${i.quantity}x ${i.name}`).join(', ')}
+                    </td>
+                    <td className="p-2 border-r border-slate-200 text-right font-mono">{formatNPR(inv.subtotal)}</td>
+                    <td className="p-2 border-r border-slate-200 text-right font-mono">{formatNPR(inv.taxAmount)}</td>
+                    <td className="p-2 border-r border-slate-200 text-right font-mono font-bold text-emerald-800">{formatNPR(inv.grandTotal)}</td>
+                    <td className="p-2 border-r border-slate-200 text-right font-mono font-bold text-blue-800">{formatNPR(inv.totalProfit)}</td>
+                    <td className="p-2 border-r border-slate-200">
+                      <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-100 text-emerald-800">
+                        {inv.paymentMethod}
+                      </span>
+                    </td>
+                    <td className="p-2 text-center">
+                      {onOpenInvoice && (
+                        <button
+                          onClick={() => onOpenInvoice(inv)}
+                          className="px-2.5 py-1 bg-slate-900 hover:bg-slate-800 text-white rounded text-[11px] font-bold flex items-center gap-1 shadow-2xs mx-auto"
+                        >
+                          <LinkIcon className="w-3 h-3" /> View
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* SHEET 3: RETURNS & WARRANTY MODULE */}
+      {activeSheet === 'returns' && (
+        <ReturnsWarrantySpreadsheet
+          returns={returns}
+          inventory={inventory}
+          invoices={invoices}
+          shopConfig={shopConfig}
+          onAddReturn={onAddReturn || (() => {})}
+          onUpdateReturn={onUpdateReturn}
+          onDeleteReturn={onDeleteReturn}
+          onOpenInvoice={onOpenInvoice}
+        />
+      )}
+
+      {/* SHEET 4: MONTHLY ANALYSIS */}
+      {activeSheet === 'monthly' && (
+        <div className="p-6 bg-slate-50 space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div className="p-4 bg-white rounded-xl border border-slate-200 shadow-2xs">
+              <span className="text-xs text-slate-500 block uppercase font-semibold">Total Gross Sales</span>
+              <span className="text-xl font-extrabold text-slate-900 mt-1 block">
+                {formatNPR(invoices.reduce((a, b) => a + b.grandTotal, 0))}
+              </span>
+              <span className="text-[11px] text-slate-400 font-mono mt-0.5 block">=SUM(Sales!H2:H{invoices.length + 1})</span>
+            </div>
+            <div className="p-4 bg-white rounded-xl border border-slate-200 shadow-2xs">
+              <span className="text-xs text-slate-500 block uppercase font-semibold">Total Net Profit</span>
+              <span className="text-xl font-extrabold text-emerald-700 mt-1 block">
+                {formatNPR(invoices.reduce((a, b) => a + b.totalProfit, 0))}
+              </span>
+              <span className="text-[11px] text-slate-400 font-mono mt-0.5 block">=SUM(Sales!I2:I{invoices.length + 1})</span>
+            </div>
+            <div className="p-4 bg-white rounded-xl border border-slate-200 shadow-2xs">
+              <span className="text-xs text-slate-500 block uppercase font-semibold">Returns & Warranty Claims</span>
+              <span className="text-xl font-extrabold text-rose-700 mt-1 block">
+                {returns.length} claims tracked
+              </span>
+              <span className="text-[11px] text-slate-400 font-mono mt-0.5 block">=COUNTA(Returns!A2:A{returns.length + 1})</span>
+            </div>
+          </div>
+          <p className="text-xs text-slate-500">
+            Export to Excel (.xlsx) generates all four workbook sheets with native Microsoft Excel formulas.
+          </p>
+        </div>
+      )}
 
       {/* Excel Sheet Tabs at bottom */}
       <div className="bg-slate-100 border-t border-slate-200 px-3 py-1 flex items-center justify-between text-xs">
@@ -512,13 +713,13 @@ export function ExcelGridView({
           </button>
           <button
             onClick={() => setActiveSheet('returns')}
-            className={`px-3 py-1.5 rounded-t font-semibold border-t-2 text-xs transition-colors ${
+            className={`px-3 py-1.5 rounded-t font-bold border-t-2 text-xs transition-colors ${
               activeSheet === 'returns'
-                ? 'bg-white text-emerald-800 border-emerald-600 shadow-xs'
-                : 'text-slate-600 hover:bg-slate-200 border-transparent'
+                ? 'bg-white text-rose-700 border-rose-600 shadow-xs'
+                : 'text-rose-700 hover:bg-slate-200 border-transparent'
             }`}
           >
-            Sheet 3: Returns_RMA ({returns.length})
+            Sheet 3: Returns_and_Warranty ({returns.length})
           </button>
           <button
             onClick={() => setActiveSheet('monthly')}
@@ -533,7 +734,7 @@ export function ExcelGridView({
         </div>
 
         <div className="flex items-center gap-3 text-slate-500 text-[11px] hidden sm:flex">
-          <span>Rows: {inventory.length}</span>
+          <span>Active: {activeSheet.toUpperCase()}</span>
           <span>•</span>
           <span>Formulas: Active</span>
           <span>•</span>

@@ -28,6 +28,9 @@ export function toNepaliDigits(input: string | number): string {
   return String(input).replace(/\d/g, (d) => NEPALI_DIGITS[parseInt(d, 10)]);
 }
 
+const NPR_DEFAULT_FORMAT_CACHE = new Map<number, string>();
+const MAX_NPR_CACHE_SIZE = 1000;
+
 /**
  * Formats a numeric currency amount into Nepalese Rupee (NPR / रु)
  * using South Asian numbering format (e.g. रु 1,45,000.00)
@@ -41,6 +44,18 @@ export function formatNPR(
     space?: boolean;
   }
 ): string {
+  const isDefaultOptions = !options || (
+    options.showDecimals !== false &&
+    options.symbol === undefined &&
+    !options.nepaliDigits &&
+    options.space !== false
+  );
+
+  if (isDefaultOptions && typeof amount === 'number') {
+    const cached = NPR_DEFAULT_FORMAT_CACHE.get(amount);
+    if (cached) return cached;
+  }
+
   const {
     showDecimals = true,
     symbol = 'रु',
@@ -81,7 +96,17 @@ export function formatNPR(
 
   const signStr = isNegative ? '-' : '';
   const spacing = space ? ' ' : '';
-  return `${signStr}${symbol}${spacing}${finalNumberStr}`;
+  const result = `${signStr}${symbol}${spacing}${finalNumberStr}`;
+
+  if (isDefaultOptions && typeof amount === 'number') {
+    if (NPR_DEFAULT_FORMAT_CACHE.size >= MAX_NPR_CACHE_SIZE) {
+      const firstKey = NPR_DEFAULT_FORMAT_CACHE.keys().next().value;
+      if (firstKey !== undefined) NPR_DEFAULT_FORMAT_CACHE.delete(firstKey);
+    }
+    NPR_DEFAULT_FORMAT_CACHE.set(amount, result);
+  }
+
+  return result;
 }
 
 /**
@@ -156,10 +181,32 @@ const BS_CALENDAR_DATA: Record<number, number[]> = {
 const REF_AD_DATE = new Date(Date.UTC(2024, 3, 13)); // 2024-04-13
 const REF_BS_YEAR = 2081;
 
+// In-memory LRU-style caches for ultra-fast repeated lookups
+const BS_CONVERSION_CACHE = new Map<string, BikramSambatDate>();
+const MAX_CACHE_SIZE = 2000;
+
+export function clearLocaleCaches(): void {
+  BS_CONVERSION_CACHE.clear();
+}
+
 export function toBikramSambat(adDateInput: string | Date): BikramSambatDate {
+  let cacheKey: string;
+  if (typeof adDateInput === 'string') {
+    cacheKey = adDateInput.split(' ')[0].split('T')[0];
+  } else if (adDateInput instanceof Date) {
+    cacheKey = `${adDateInput.getUTCFullYear()}-${adDateInput.getUTCMonth() + 1}-${adDateInput.getUTCDate()}`;
+  } else {
+    cacheKey = String(adDateInput);
+  }
+
+  const cached = BS_CONVERSION_CACHE.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
   let adDate: Date;
   if (typeof adDateInput === 'string') {
-    const cleanStr = adDateInput.split(' ')[0].split('T')[0];
+    const cleanStr = cacheKey;
     const parts = cleanStr.split('-').map((p) => parseInt(p, 10));
     if (parts.length === 3 && !isNaN(parts[0])) {
       adDate = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
@@ -210,7 +257,7 @@ export function toBikramSambat(adDateInput: string | Date): BikramSambatDate {
   const DAYS_NP = ['आइतबार', 'सोमबार', 'मंगलबार', 'बुधबार', 'बिहीबार', 'शुक्रबार', 'शनिबार'];
   const dayOfWeekNepali = DAYS_NP[adDate.getUTCDay()] || 'दिन';
 
-  return {
+  const result: BikramSambatDate = {
     bsYear,
     bsMonth,
     bsDay,
@@ -221,6 +268,14 @@ export function toBikramSambat(adDateInput: string | Date): BikramSambatDate {
     formattedNp: `${toNepaliDigits(bsYear)} ${bsMonthNameNp} ${toNepaliDigits(bsDay)}`,
     dayOfWeekNepali,
   };
+
+  if (BS_CONVERSION_CACHE.size >= MAX_CACHE_SIZE) {
+    const firstKey = BS_CONVERSION_CACHE.keys().next().value;
+    if (firstKey) BS_CONVERSION_CACHE.delete(firstKey);
+  }
+  BS_CONVERSION_CACHE.set(cacheKey, result);
+
+  return result;
 }
 
 /**

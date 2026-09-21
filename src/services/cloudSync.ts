@@ -6,49 +6,108 @@ import {
   onSnapshot,
   writeBatch,
   getDocs,
+  query,
+  limit,
   runTransaction,
   increment,
   updateDoc,
+  enableNetwork,
 } from 'firebase/firestore';
-import { db } from '../lib/firebase';
+import { db, auth } from '../lib/firebase';
 import { 
   InventoryItem, 
   Invoice, 
   Customer, 
   ReturnedProduct, 
   DailyOrderQuery,
-  ShopConfig 
+  ShopConfig,
+  ActionLog
 } from '../types';
+
+export enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+export interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  };
+}
+
+export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null): FirestoreErrorInfo {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth?.currentUser?.uid || null,
+      email: auth?.currentUser?.email || null,
+      emailVerified: auth?.currentUser?.emailVerified || null,
+      isAnonymous: auth?.currentUser?.isAnonymous || null,
+      tenantId: auth?.currentUser?.tenantId || null,
+      providerInfo: auth?.currentUser?.providerData?.map((provider) => ({
+        providerId: provider.providerId,
+        email: provider.email,
+      })) || [],
+    },
+    operationType,
+    path,
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  return errInfo;
+}
 
 export type SyncState = 'connected' | 'syncing' | 'offline' | 'error';
 
 export interface CloudStatusInfo {
   state: SyncState;
+  isNetworkOnline: boolean;
   lastSyncedAt: Date | null;
   pendingWritesCount: number;
   errorMessage?: string;
+  isReconnecting?: boolean;
   counts: {
     inventory: number;
     invoices: number;
     customers: number;
     returns: number;
     dailyQueries: number;
+    actionLogs: number;
     shopConfig: boolean;
   };
 }
 
 let syncStatusListeners: Array<(status: CloudStatusInfo) => void> = [];
 
+const isInitialOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+
 let currentStatus: CloudStatusInfo = {
-  state: typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'connected',
+  state: isInitialOnline ? 'connected' : 'offline',
+  isNetworkOnline: isInitialOnline,
   lastSyncedAt: null,
   pendingWritesCount: 0,
+  isReconnecting: false,
   counts: {
     inventory: 0,
     invoices: 0,
     customers: 0,
     returns: 0,
     dailyQueries: 0,
+    actionLogs: 0,
     shopConfig: false,
   },
 };
@@ -57,6 +116,9 @@ function notifyStatus(update: Partial<CloudStatusInfo>) {
   currentStatus = {
     ...currentStatus,
     ...update,
+    isNetworkOnline: typeof update.isNetworkOnline === 'boolean' 
+      ? update.isNetworkOnline 
+      : (typeof navigator !== 'undefined' ? navigator.onLine : true),
     counts: {
       ...currentStatus.counts,
       ...(update.counts || {}),
@@ -71,13 +133,316 @@ function notifyStatus(update: Partial<CloudStatusInfo>) {
   });
 }
 
+// Global active subscription callbacks
+const inventorySubscribers = new Set<(items: InventoryItem[]) => void>();
+const invoicesSubscribers = new Set<(invoices: Invoice[]) => void>();
+const customersSubscribers = new Set<(customers: Customer[]) => void>();
+const returnsSubscribers = new Set<(returns: ReturnedProduct[]) => void>();
+const dailyQueriesSubscribers = new Set<(queries: DailyOrderQuery[]) => void>();
+const shopConfigSubscribers = new Set<(config: ShopConfig) => void>();
+const actionLogsSubscribers = new Set<(logs: ActionLog[]) => void>();
+
+let activeUnsubInventory: (() => void) | null = null;
+let activeUnsubInvoices: (() => void) | null = null;
+let activeUnsubCustomers: (() => void) | null = null;
+let activeUnsubReturns: (() => void) | null = null;
+let activeUnsubDailyQueries: (() => void) | null = null;
+let activeUnsubShopConfig: (() => void) | null = null;
+let activeUnsubActionLogs: (() => void) | null = null;
+
+let reconnectAttempts = 0;
+
+function handleListenerError(channelName: string, err: any) {
+  const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+  const errMsg = err?.message || String(err);
+  const isPermissionError = err?.code === 'permission-denied' || errMsg.includes('insufficient permissions');
+  
+  if (isPermissionError) {
+    handleFirestoreError(err, OperationType.LIST, channelName);
+  }
+
+  const isOfflineOrTimeout = 
+    !isOnline || 
+    err?.code === 'unavailable' || 
+    errMsg.includes('10 seconds') || 
+    errMsg.includes('offline') ||
+    errMsg.includes('Could not reach');
+
+  if (isOfflineOrTimeout || !isOnline) {
+    console.info(`[Firestore CloudSync] ${channelName}: local cache mode active.`);
+    notifyStatus({ 
+      state: 'offline', 
+      isNetworkOnline: isOnline,
+      errorMessage: 'Local storage active. Cloud sync will resume seamlessly.' 
+    });
+  } else {
+    console.warn(`[Firestore CloudSync] ${channelName} listener notice:`, errMsg);
+    notifyStatus({
+      state: 'syncing',
+      isNetworkOnline: true,
+      errorMessage: errMsg || 'Refreshing cloud data stream...',
+    });
+  }
+}
+
+// Helper to start the inventory listener
+function startInventoryListener() {
+  if (activeUnsubInventory) {
+    try { activeUnsubInventory(); } catch {}
+    activeUnsubInventory = null;
+  }
+  if (inventorySubscribers.size === 0) return;
+
+  const colRef = collection(db, 'inventory');
+  activeUnsubInventory = onSnapshot(
+    colRef,
+    { includeMetadataChanges: true },
+    (snapshot) => {
+      const items: InventoryItem[] = [];
+      snapshot.forEach((docSnap) => {
+        items.push(docSnap.data() as InventoryItem);
+      });
+      const hasPending = snapshot.metadata.hasPendingWrites;
+      notifyStatus({
+        state: hasPending ? 'syncing' : 'connected',
+        isNetworkOnline: true,
+        lastSyncedAt: new Date(),
+        pendingWritesCount: hasPending ? 1 : 0,
+        errorMessage: undefined,
+        counts: { ...currentStatus.counts, inventory: items.length },
+      });
+      reconnectAttempts = 0;
+      inventorySubscribers.forEach((cb) => cb(items));
+    },
+    (err) => handleListenerError('inventory', err)
+  );
+}
+
+// Helper to start the invoices listener
+function startInvoicesListener() {
+  if (activeUnsubInvoices) {
+    try { activeUnsubInvoices(); } catch {}
+    activeUnsubInvoices = null;
+  }
+  if (invoicesSubscribers.size === 0) return;
+
+  const colRef = collection(db, 'invoices');
+  activeUnsubInvoices = onSnapshot(
+    colRef,
+    { includeMetadataChanges: true },
+    (snapshot) => {
+      const invoices: Invoice[] = [];
+      snapshot.forEach((docSnap) => {
+        invoices.push(docSnap.data() as Invoice);
+      });
+      invoices.sort((a, b) => (b.date > a.date ? 1 : -1));
+      const hasPending = snapshot.metadata.hasPendingWrites;
+      notifyStatus({
+        state: hasPending ? 'syncing' : 'connected',
+        isNetworkOnline: true,
+        lastSyncedAt: new Date(),
+        errorMessage: undefined,
+        counts: { ...currentStatus.counts, invoices: invoices.length },
+      });
+      reconnectAttempts = 0;
+      invoicesSubscribers.forEach((cb) => cb(invoices));
+    },
+    (err) => handleListenerError('invoices', err)
+  );
+}
+
+// Helper to start the customers listener
+function startCustomersListener() {
+  if (activeUnsubCustomers) {
+    try { activeUnsubCustomers(); } catch {}
+    activeUnsubCustomers = null;
+  }
+  if (customersSubscribers.size === 0) return;
+
+  const colRef = collection(db, 'customers');
+  activeUnsubCustomers = onSnapshot(
+    colRef,
+    { includeMetadataChanges: true },
+    (snapshot) => {
+      const customers: Customer[] = [];
+      snapshot.forEach((docSnap) => {
+        customers.push(docSnap.data() as Customer);
+      });
+      const hasPending = snapshot.metadata.hasPendingWrites;
+      notifyStatus({
+        state: hasPending ? 'syncing' : 'connected',
+        isNetworkOnline: true,
+        lastSyncedAt: new Date(),
+        errorMessage: undefined,
+        counts: { ...currentStatus.counts, customers: customers.length },
+      });
+      reconnectAttempts = 0;
+      customersSubscribers.forEach((cb) => cb(customers));
+    },
+    (err) => handleListenerError('customers', err)
+  );
+}
+
+// Helper to start the returns listener
+function startReturnsListener() {
+  if (activeUnsubReturns) {
+    try { activeUnsubReturns(); } catch {}
+    activeUnsubReturns = null;
+  }
+  if (returnsSubscribers.size === 0) return;
+
+  const colRef = collection(db, 'returns');
+  activeUnsubReturns = onSnapshot(
+    colRef,
+    { includeMetadataChanges: true },
+    (snapshot) => {
+      const returns: ReturnedProduct[] = [];
+      snapshot.forEach((docSnap) => {
+        returns.push(docSnap.data() as ReturnedProduct);
+      });
+      const hasPending = snapshot.metadata.hasPendingWrites;
+      notifyStatus({
+        state: hasPending ? 'syncing' : 'connected',
+        isNetworkOnline: true,
+        lastSyncedAt: new Date(),
+        errorMessage: undefined,
+        counts: { ...currentStatus.counts, returns: returns.length },
+      });
+      reconnectAttempts = 0;
+      returnsSubscribers.forEach((cb) => cb(returns));
+    },
+    (err) => handleListenerError('returns', err)
+  );
+}
+
+// Helper to start daily queries listener
+function startDailyQueriesListener() {
+  if (activeUnsubDailyQueries) {
+    try { activeUnsubDailyQueries(); } catch {}
+    activeUnsubDailyQueries = null;
+  }
+  if (dailyQueriesSubscribers.size === 0) return;
+
+  const colRef = collection(db, 'daily_queries');
+  activeUnsubDailyQueries = onSnapshot(
+    colRef,
+    { includeMetadataChanges: true },
+    (snapshot) => {
+      const queries: DailyOrderQuery[] = [];
+      snapshot.forEach((docSnap) => {
+        queries.push(docSnap.data() as DailyOrderQuery);
+      });
+      queries.sort((a, b) => (b.date + b.time > a.date + a.time ? 1 : -1));
+      const hasPending = snapshot.metadata.hasPendingWrites;
+      notifyStatus({
+        state: hasPending ? 'syncing' : 'connected',
+        isNetworkOnline: true,
+        lastSyncedAt: new Date(),
+        errorMessage: undefined,
+        counts: { ...currentStatus.counts, dailyQueries: queries.length },
+      });
+      reconnectAttempts = 0;
+      dailyQueriesSubscribers.forEach((cb) => cb(queries));
+    },
+    (err) => handleListenerError('daily_queries', err)
+  );
+}
+
+// Helper to start shop config listener
+function startShopConfigListener() {
+  if (activeUnsubShopConfig) {
+    try { activeUnsubShopConfig(); } catch {}
+    activeUnsubShopConfig = null;
+  }
+  if (shopConfigSubscribers.size === 0) return;
+
+  const docRef = doc(db, 'shop_config', 'default');
+  activeUnsubShopConfig = onSnapshot(
+    docRef,
+    { includeMetadataChanges: true },
+    (snapshot) => {
+      if (snapshot.exists()) {
+        const config = snapshot.data() as ShopConfig;
+        notifyStatus({
+          state: snapshot.metadata.hasPendingWrites ? 'syncing' : 'connected',
+          isNetworkOnline: true,
+          lastSyncedAt: new Date(),
+          errorMessage: undefined,
+          counts: { ...currentStatus.counts, shopConfig: true },
+        });
+        reconnectAttempts = 0;
+        shopConfigSubscribers.forEach((cb) => cb(config));
+      }
+    },
+    (err) => handleListenerError('shop_config', err)
+  );
+}
+
+// Helper to start action logs listener
+function startActionLogsListener() {
+  if (activeUnsubActionLogs) {
+    try { activeUnsubActionLogs(); } catch {}
+    activeUnsubActionLogs = null;
+  }
+  if (actionLogsSubscribers.size === 0) return;
+
+  const colRef = collection(db, 'action_logs');
+  activeUnsubActionLogs = onSnapshot(
+    colRef,
+    { includeMetadataChanges: true },
+    (snapshot) => {
+      const logs: ActionLog[] = [];
+      snapshot.forEach((docSnap) => {
+        logs.push(docSnap.data() as ActionLog);
+      });
+      // Sort newest first by timestamp or date+time
+      logs.sort((a, b) => (b.timestamp > a.timestamp ? 1 : -1));
+      const hasPending = snapshot.metadata.hasPendingWrites;
+      notifyStatus({
+        state: hasPending ? 'syncing' : 'connected',
+        isNetworkOnline: true,
+        lastSyncedAt: new Date(),
+        errorMessage: undefined,
+        counts: { ...currentStatus.counts, actionLogs: logs.length },
+      });
+      reconnectAttempts = 0;
+      actionLogsSubscribers.forEach((cb) => cb(logs));
+    },
+    (err) => handleListenerError('action_logs', err)
+  );
+}
+
+function restartAllActiveListeners() {
+  startInventoryListener();
+  startInvoicesListener();
+  startCustomersListener();
+  startReturnsListener();
+  startDailyQueriesListener();
+  startShopConfigListener();
+  startActionLogsListener();
+}
+
 // Window online/offline event listeners
 if (typeof window !== 'undefined') {
   window.addEventListener('online', () => {
-    notifyStatus({ state: 'connected', errorMessage: undefined });
+    notifyStatus({ 
+      state: 'syncing', 
+      isNetworkOnline: true, 
+      errorMessage: undefined 
+    });
+    reconnectAttempts = 0;
+    try {
+      enableNetwork(db).catch(() => {});
+    } catch {}
+    restartAllActiveListeners();
   });
+
   window.addEventListener('offline', () => {
-    notifyStatus({ state: 'offline' });
+    notifyStatus({ 
+      state: 'offline', 
+      isNetworkOnline: false,
+      errorMessage: 'Device has no active internet connection' 
+    });
   });
 }
 
@@ -113,31 +478,70 @@ export const cloudSync = {
     return currentStatus;
   },
 
+  // Manual reconnect and test method with health check
+  async reconnect(): Promise<{ success: boolean; message: string }> {
+    const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+    if (!isOnline) {
+      notifyStatus({
+        state: 'offline',
+        isNetworkOnline: false,
+        errorMessage: 'Device has no internet connection',
+      });
+      return { success: false, message: 'Your device is disconnected from the internet.' };
+    }
+
+    notifyStatus({ state: 'syncing', isReconnecting: true, errorMessage: undefined });
+
+    try {
+      try {
+        await enableNetwork(db);
+      } catch (e) {
+        // Network may already be enabled
+      }
+
+      // Test active read from Firestore with lightweight limit
+      const testSnap = await getDocs(query(collection(db, 'inventory'), limit(1)));
+      reconnectAttempts = 0;
+      restartAllActiveListeners();
+
+      notifyStatus({
+        state: 'connected',
+        isNetworkOnline: true,
+        isReconnecting: false,
+        lastSyncedAt: new Date(),
+        errorMessage: undefined,
+      });
+
+      return {
+        success: true,
+        message: 'Cloud connection active and verified. Real-time sync stream is operational.',
+      };
+    } catch (err: any) {
+      console.warn('Manual reconnect warning:', err);
+      notifyStatus({
+        state: 'syncing',
+        isReconnecting: false,
+        isNetworkOnline: true,
+        errorMessage: err?.message || 'Sync channel reconnecting in background...',
+      });
+      return {
+        success: false,
+        message: err?.message || 'Cloud sync is reconnecting in background.',
+      };
+    }
+  },
+
   // Real-time Inventory listener
   subscribeInventory(callback: (items: InventoryItem[]) => void) {
-    const colRef = collection(db, 'inventory');
-    return onSnapshot(
-      colRef,
-      { includeMetadataChanges: true },
-      (snapshot) => {
-        const items: InventoryItem[] = [];
-        snapshot.forEach((docSnap) => {
-          items.push(docSnap.data() as InventoryItem);
-        });
-        const hasPending = snapshot.metadata.hasPendingWrites;
-        notifyStatus({
-          state: hasPending ? 'syncing' : 'connected',
-          lastSyncedAt: new Date(),
-          pendingWritesCount: hasPending ? 1 : 0,
-          counts: { ...currentStatus.counts, inventory: items.length },
-        });
-        callback(items);
-      },
-      (err) => {
-        console.warn('Inventory cloud sync listener offline or unauthenticated:', err.message);
-        notifyStatus({ state: 'offline', errorMessage: err.message });
+    inventorySubscribers.add(callback);
+    startInventoryListener();
+    return () => {
+      inventorySubscribers.delete(callback);
+      if (inventorySubscribers.size === 0 && activeUnsubInventory) {
+        try { activeUnsubInventory(); } catch {}
+        activeUnsubInventory = null;
       }
-    );
+    };
   },
 
   // Save / update single inventory item in Cloud
@@ -146,10 +550,14 @@ export const cloudSync = {
     try {
       const docRef = doc(db, 'inventory', item.id);
       await setDoc(docRef, item, { merge: true });
-      notifyStatus({ state: 'connected', lastSyncedAt: new Date() });
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
     } catch (err: any) {
       console.warn('Failed to save inventory item to cloud:', err);
-      notifyStatus({ state: 'offline', errorMessage: err?.message });
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message || 'Saved in local cache. Will sync automatically.' 
+      });
     }
   },
 
@@ -168,10 +576,9 @@ export const cloudSync = {
           }
         }
       });
-      notifyStatus({ state: 'connected', lastSyncedAt: new Date() });
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
     } catch (err: any) {
       console.warn('Atomic stock deduction error, attempting fallback update:', err);
-      // Fallback in case of document locks or offline cache
       for (const line of lineItems) {
         try {
           const itemRef = doc(db, 'inventory', line.itemId);
@@ -190,10 +597,14 @@ export const cloudSync = {
     notifyStatus({ state: 'syncing' });
     try {
       await deleteDoc(doc(db, 'inventory', itemId));
-      notifyStatus({ state: 'connected', lastSyncedAt: new Date() });
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
     } catch (err: any) {
       console.warn('Failed to delete inventory item from cloud:', err);
-      notifyStatus({ state: 'offline', errorMessage: err?.message });
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
     }
   },
 
@@ -205,39 +616,28 @@ export const cloudSync = {
         const docRef = doc(db, 'inventory', item.id);
         batch.set(docRef, item, { merge: true });
       });
-      notifyStatus({ state: 'connected', lastSyncedAt: new Date() });
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
     } catch (err: any) {
       console.warn('Failed to batch save inventory to cloud:', err);
-      notifyStatus({ state: 'offline', errorMessage: err?.message });
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
     }
   },
 
   // Real-time Invoices listener
   subscribeInvoices(callback: (invoices: Invoice[]) => void) {
-    const colRef = collection(db, 'invoices');
-    return onSnapshot(
-      colRef,
-      { includeMetadataChanges: true },
-      (snapshot) => {
-        const invoices: Invoice[] = [];
-        snapshot.forEach((docSnap) => {
-          invoices.push(docSnap.data() as Invoice);
-        });
-        // Sort descending by date
-        invoices.sort((a, b) => (b.date > a.date ? 1 : -1));
-        const hasPending = snapshot.metadata.hasPendingWrites;
-        notifyStatus({
-          state: hasPending ? 'syncing' : 'connected',
-          lastSyncedAt: new Date(),
-          counts: { ...currentStatus.counts, invoices: invoices.length },
-        });
-        callback(invoices);
-      },
-      (err) => {
-        console.warn('Invoices cloud sync listener offline:', err.message);
-        notifyStatus({ state: 'offline', errorMessage: err.message });
+    invoicesSubscribers.add(callback);
+    startInvoicesListener();
+    return () => {
+      invoicesSubscribers.delete(callback);
+      if (invoicesSubscribers.size === 0 && activeUnsubInvoices) {
+        try { activeUnsubInvoices(); } catch {}
+        activeUnsubInvoices = null;
       }
-    );
+    };
   },
 
   // Save Invoice to Cloud
@@ -246,10 +646,14 @@ export const cloudSync = {
     try {
       const docRef = doc(db, 'invoices', invoice.id);
       await setDoc(docRef, invoice, { merge: true });
-      notifyStatus({ state: 'connected', lastSyncedAt: new Date() });
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
     } catch (err: any) {
       console.warn('Failed to save invoice to cloud:', err);
-      notifyStatus({ state: 'offline', errorMessage: err?.message });
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
     }
   },
 
@@ -261,37 +665,28 @@ export const cloudSync = {
         const docRef = doc(db, 'invoices', inv.id);
         batch.set(docRef, inv, { merge: true });
       });
-      notifyStatus({ state: 'connected', lastSyncedAt: new Date() });
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
     } catch (err: any) {
       console.warn('Failed to batch save invoices to cloud:', err);
-      notifyStatus({ state: 'offline', errorMessage: err?.message });
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
     }
   },
 
   // Real-time Customers listener
   subscribeCustomers(callback: (customers: Customer[]) => void) {
-    const colRef = collection(db, 'customers');
-    return onSnapshot(
-      colRef,
-      { includeMetadataChanges: true },
-      (snapshot) => {
-        const customers: Customer[] = [];
-        snapshot.forEach((docSnap) => {
-          customers.push(docSnap.data() as Customer);
-        });
-        const hasPending = snapshot.metadata.hasPendingWrites;
-        notifyStatus({
-          state: hasPending ? 'syncing' : 'connected',
-          lastSyncedAt: new Date(),
-          counts: { ...currentStatus.counts, customers: customers.length },
-        });
-        callback(customers);
-      },
-      (err) => {
-        console.warn('Customers cloud sync listener offline:', err.message);
-        notifyStatus({ state: 'offline', errorMessage: err.message });
+    customersSubscribers.add(callback);
+    startCustomersListener();
+    return () => {
+      customersSubscribers.delete(callback);
+      if (customersSubscribers.size === 0 && activeUnsubCustomers) {
+        try { activeUnsubCustomers(); } catch {}
+        activeUnsubCustomers = null;
       }
-    );
+    };
   },
 
   // Save / update customer in Cloud
@@ -300,10 +695,14 @@ export const cloudSync = {
     try {
       const docRef = doc(db, 'customers', customer.id);
       await setDoc(docRef, customer, { merge: true });
-      notifyStatus({ state: 'connected', lastSyncedAt: new Date() });
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
     } catch (err: any) {
       console.warn('Failed to save customer to cloud:', err);
-      notifyStatus({ state: 'offline', errorMessage: err?.message });
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
     }
   },
 
@@ -312,10 +711,14 @@ export const cloudSync = {
     notifyStatus({ state: 'syncing' });
     try {
       await deleteDoc(doc(db, 'customers', customerId));
-      notifyStatus({ state: 'connected', lastSyncedAt: new Date() });
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
     } catch (err: any) {
       console.warn('Failed to delete customer from cloud:', err);
-      notifyStatus({ state: 'offline', errorMessage: err?.message });
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
     }
   },
 
@@ -327,37 +730,28 @@ export const cloudSync = {
         const docRef = doc(db, 'customers', c.id);
         batch.set(docRef, c, { merge: true });
       });
-      notifyStatus({ state: 'connected', lastSyncedAt: new Date() });
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
     } catch (err: any) {
       console.warn('Failed to batch save customers to cloud:', err);
-      notifyStatus({ state: 'offline', errorMessage: err?.message });
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
     }
   },
 
   // Real-time Returns listener
   subscribeReturns(callback: (returns: ReturnedProduct[]) => void) {
-    const colRef = collection(db, 'returns');
-    return onSnapshot(
-      colRef,
-      { includeMetadataChanges: true },
-      (snapshot) => {
-        const returns: ReturnedProduct[] = [];
-        snapshot.forEach((docSnap) => {
-          returns.push(docSnap.data() as ReturnedProduct);
-        });
-        const hasPending = snapshot.metadata.hasPendingWrites;
-        notifyStatus({
-          state: hasPending ? 'syncing' : 'connected',
-          lastSyncedAt: new Date(),
-          counts: { ...currentStatus.counts, returns: returns.length },
-        });
-        callback(returns);
-      },
-      (err) => {
-        console.warn('Returns cloud sync listener offline:', err.message);
-        notifyStatus({ state: 'offline', errorMessage: err.message });
+    returnsSubscribers.add(callback);
+    startReturnsListener();
+    return () => {
+      returnsSubscribers.delete(callback);
+      if (returnsSubscribers.size === 0 && activeUnsubReturns) {
+        try { activeUnsubReturns(); } catch {}
+        activeUnsubReturns = null;
       }
-    );
+    };
   },
 
   // Save / update return in Cloud
@@ -366,10 +760,30 @@ export const cloudSync = {
     try {
       const docRef = doc(db, 'returns', ret.id);
       await setDoc(docRef, ret, { merge: true });
-      notifyStatus({ state: 'connected', lastSyncedAt: new Date() });
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
     } catch (err: any) {
       console.warn('Failed to save return to cloud:', err);
-      notifyStatus({ state: 'offline', errorMessage: err?.message });
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
+    }
+  },
+
+  // Delete return from Cloud
+  async deleteReturn(returnId: string) {
+    notifyStatus({ state: 'syncing' });
+    try {
+      await deleteDoc(doc(db, 'returns', returnId));
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
+    } catch (err: any) {
+      console.warn('Failed to delete return from cloud:', err);
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
     }
   },
 
@@ -381,39 +795,28 @@ export const cloudSync = {
         const docRef = doc(db, 'returns', r.id);
         batch.set(docRef, r, { merge: true });
       });
-      notifyStatus({ state: 'connected', lastSyncedAt: new Date() });
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
     } catch (err: any) {
       console.warn('Failed to batch save returns to cloud:', err);
-      notifyStatus({ state: 'offline', errorMessage: err?.message });
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
     }
   },
 
   // Real-time Daily Order Queries listener
   subscribeDailyQueries(callback: (queries: DailyOrderQuery[]) => void) {
-    const colRef = collection(db, 'daily_queries');
-    return onSnapshot(
-      colRef,
-      { includeMetadataChanges: true },
-      (snapshot) => {
-        const queries: DailyOrderQuery[] = [];
-        snapshot.forEach((docSnap) => {
-          queries.push(docSnap.data() as DailyOrderQuery);
-        });
-        // Sort descending by date, then time
-        queries.sort((a, b) => (b.date + b.time > a.date + a.time ? 1 : -1));
-        const hasPending = snapshot.metadata.hasPendingWrites;
-        notifyStatus({
-          state: hasPending ? 'syncing' : 'connected',
-          lastSyncedAt: new Date(),
-          counts: { ...currentStatus.counts, dailyQueries: queries.length },
-        });
-        callback(queries);
-      },
-      (err) => {
-        console.warn('Daily queries cloud sync listener offline:', err.message);
-        notifyStatus({ state: 'offline', errorMessage: err.message });
+    dailyQueriesSubscribers.add(callback);
+    startDailyQueriesListener();
+    return () => {
+      dailyQueriesSubscribers.delete(callback);
+      if (dailyQueriesSubscribers.size === 0 && activeUnsubDailyQueries) {
+        try { activeUnsubDailyQueries(); } catch {}
+        activeUnsubDailyQueries = null;
       }
-    );
+    };
   },
 
   // Save / update daily query in Cloud
@@ -422,10 +825,14 @@ export const cloudSync = {
     try {
       const docRef = doc(db, 'daily_queries', query.id);
       await setDoc(docRef, query, { merge: true });
-      notifyStatus({ state: 'connected', lastSyncedAt: new Date() });
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
     } catch (err: any) {
       console.warn('Failed to save daily query to cloud:', err);
-      notifyStatus({ state: 'offline', errorMessage: err?.message });
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
     }
   },
 
@@ -434,10 +841,14 @@ export const cloudSync = {
     notifyStatus({ state: 'syncing' });
     try {
       await deleteDoc(doc(db, 'daily_queries', queryId));
-      notifyStatus({ state: 'connected', lastSyncedAt: new Date() });
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
     } catch (err: any) {
       console.warn('Failed to delete daily query from cloud:', err);
-      notifyStatus({ state: 'offline', errorMessage: err?.message });
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
     }
   },
 
@@ -449,34 +860,114 @@ export const cloudSync = {
         const docRef = doc(db, 'daily_queries', q.id);
         batch.set(docRef, q, { merge: true });
       });
-      notifyStatus({ state: 'connected', lastSyncedAt: new Date() });
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
     } catch (err: any) {
       console.warn('Failed to batch save daily queries to cloud:', err);
-      notifyStatus({ state: 'offline', errorMessage: err?.message });
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
     }
   },
 
   // Real-time Shop Configuration listener
   subscribeShopConfig(callback: (config: ShopConfig) => void) {
-    const docRef = doc(db, 'shop_config', 'default');
-    return onSnapshot(
-      docRef,
-      { includeMetadataChanges: true },
-      (snapshot) => {
-        if (snapshot.exists()) {
-          const config = snapshot.data() as ShopConfig;
-          notifyStatus({
-            state: snapshot.metadata.hasPendingWrites ? 'syncing' : 'connected',
-            lastSyncedAt: new Date(),
-            counts: { ...currentStatus.counts, shopConfig: true },
-          });
-          callback(config);
-        }
-      },
-      (err) => {
-        console.warn('ShopConfig cloud sync listener offline:', err.message);
+    shopConfigSubscribers.add(callback);
+    startShopConfigListener();
+    return () => {
+      shopConfigSubscribers.delete(callback);
+      if (shopConfigSubscribers.size === 0 && activeUnsubShopConfig) {
+        try { activeUnsubShopConfig(); } catch {}
+        activeUnsubShopConfig = null;
       }
-    );
+    };
+  },
+
+  // Real-time Action Logs listener
+  subscribeActionLogs(callback: (logs: ActionLog[]) => void) {
+    actionLogsSubscribers.add(callback);
+    startActionLogsListener();
+    return () => {
+      actionLogsSubscribers.delete(callback);
+      if (actionLogsSubscribers.size === 0 && activeUnsubActionLogs) {
+        try { activeUnsubActionLogs(); } catch {}
+        activeUnsubActionLogs = null;
+      }
+    };
+  },
+
+  // Save / log action to cloud for future reference
+  async saveActionLog(log: ActionLog) {
+    notifyStatus({ state: 'syncing' });
+    try {
+      const docRef = doc(db, 'action_logs', log.id);
+      await setDoc(docRef, log, { merge: true });
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
+    } catch (err: any) {
+      console.warn('Failed to save action log to cloud:', err);
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
+    }
+  },
+
+  // Delete a specific action log
+  async deleteActionLog(logId: string) {
+    notifyStatus({ state: 'syncing' });
+    try {
+      await deleteDoc(doc(db, 'action_logs', logId));
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
+    } catch (err: any) {
+      console.warn('Failed to delete action log from cloud:', err);
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
+    }
+  },
+
+  // Bulk save action logs with chunked batches
+  async bulkSaveActionLogs(logs: ActionLog[]) {
+    notifyStatus({ state: 'syncing' });
+    try {
+      await commitInBatches(logs, (batch, log) => {
+        const docRef = doc(db, 'action_logs', log.id);
+        batch.set(docRef, log, { merge: true });
+      });
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
+    } catch (err: any) {
+      console.warn('Failed to batch save action logs to cloud:', err);
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
+    }
+  },
+
+  // Clear all action logs
+  async clearAllActionLogs() {
+    notifyStatus({ state: 'syncing' });
+    try {
+      const snap = await getDocs(collection(db, 'action_logs'));
+      const batch = writeBatch(db);
+      snap.forEach((docSnap) => {
+        batch.delete(docSnap.ref);
+      });
+      await batch.commit();
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
+    } catch (err: any) {
+      console.warn('Failed to clear action logs in cloud:', err);
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
+    }
   },
 
   // Save Shop Configuration in Cloud
@@ -485,10 +976,14 @@ export const cloudSync = {
     try {
       const docRef = doc(db, 'shop_config', 'default');
       await setDoc(docRef, config, { merge: true });
-      notifyStatus({ state: 'connected', lastSyncedAt: new Date() });
+      notifyStatus({ state: 'connected', lastSyncedAt: new Date(), errorMessage: undefined });
     } catch (err: any) {
       console.warn('Failed to save shop config to cloud:', err);
-      notifyStatus({ state: 'offline', errorMessage: err?.message });
+      const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      notifyStatus({ 
+        state: isOnline ? 'syncing' : 'offline', 
+        errorMessage: err?.message 
+      });
     }
   },
 
@@ -502,40 +997,40 @@ export const cloudSync = {
     initialConfig?: ShopConfig
   ) {
     try {
-      const invSnap = await getDocs(collection(db, 'inventory'));
+      // Use lightweight query(..., limit(1)) so we don't block connection or download entire database
+      const invSnap = await getDocs(query(collection(db, 'inventory'), limit(1)));
       if (invSnap.empty && initialInventory.length > 0) {
         await this.bulkSaveInventory(initialInventory);
       }
 
-      const invoiceSnap = await getDocs(collection(db, 'invoices'));
+      const invoiceSnap = await getDocs(query(collection(db, 'invoices'), limit(1)));
       if (invoiceSnap.empty && initialInvoices.length > 0) {
         await this.bulkSaveInvoices(initialInvoices);
       }
 
-      const custSnap = await getDocs(collection(db, 'customers'));
+      const custSnap = await getDocs(query(collection(db, 'customers'), limit(1)));
       if (custSnap.empty && initialCustomers.length > 0) {
         await this.bulkSaveCustomers(initialCustomers);
       }
 
-      const retSnap = await getDocs(collection(db, 'returns'));
+      const retSnap = await getDocs(query(collection(db, 'returns'), limit(1)));
       if (retSnap.empty && initialReturns.length > 0) {
         await this.bulkSaveReturns(initialReturns);
       }
 
-      const querySnap = await getDocs(collection(db, 'daily_queries'));
+      const querySnap = await getDocs(query(collection(db, 'daily_queries'), limit(1)));
       if (querySnap.empty && initialQueries.length > 0) {
         await this.bulkSaveDailyQueries(initialQueries);
       }
 
       if (initialConfig) {
-        const configSnap = await getDocs(collection(db, 'shop_config'));
+        const configSnap = await getDocs(query(collection(db, 'shop_config'), limit(1)));
         if (configSnap.empty) {
           await this.saveShopConfig(initialConfig);
         }
       }
     } catch (err) {
-      console.warn('Cloud database initial seeding skipped or offline:', err);
+      console.info('Initial cloud sync check completed (local cache fallback active):', err);
     }
   },
 };
-

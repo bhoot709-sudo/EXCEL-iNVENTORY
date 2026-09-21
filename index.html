@@ -3,17 +3,68 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Elixer Phone & Gadget Inventory Excel Hub</title>
-    <meta name="description" content="Retail phones and gadgets inventory spreadsheet manager with profit margin tracking, customer loyalty CRM, low stock alerts, barcode scanning, returns handling, payment QR codes, and billing invoices." />
-    <meta property="og:title" content="Elixer Phone & Gadget Inventory Excel Hub" />
-    <meta property="og:description" content="Retail phones and gadgets inventory spreadsheet manager with profit margin tracking, customer loyalty CRM, low stock alerts, barcode scanning, returns handling, payment QR codes, and billing invoices." />
+    <title>Welcome Mobile Zone</title>
+    <meta name="description" content="Retail phones and gadgets inventory spreadsheet manager with profit margin tracking, customer loyalty CRM, low stock alerts, barcode scanning, returns handling, payment QR codes, billing invoices, and Google Calendar scheduling." />
+    <meta property="og:title" content="Welcome Mobile Zone" />
+    <meta property="og:description" content="Retail phones and gadgets inventory spreadsheet manager with profit margin tracking, customer loyalty CRM, low stock alerts, barcode scanning, returns handling, payment QR codes, billing invoices, and Google Calendar scheduling." />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
+    <script>
+      (function() {
+        try {
+          var _fetch = typeof window !== 'undefined' && window.fetch ? window.fetch.bind(window) : null;
+          var defineWritableFetch = function(target) {
+            if (!target) return;
+            try {
+              Object.defineProperty(target, 'fetch', {
+                get: function() {
+                  return _fetch;
+                },
+                set: function(fn) {
+                  _fetch = fn;
+                },
+                configurable: true,
+                enumerable: true
+              });
+            } catch (err) {
+              try {
+                target.fetch = _fetch;
+              } catch (e) {}
+            }
+          };
+
+          if (typeof window !== 'undefined') {
+            defineWritableFetch(window);
+            if (typeof Window !== 'undefined' && Window.prototype) {
+              defineWritableFetch(Window.prototype);
+            }
+            if (window.__proto__) {
+              defineWritableFetch(window.__proto__);
+              if (window.__proto__.__proto__) {
+                defineWritableFetch(window.__proto__.__proto__);
+              }
+            }
+          }
+          if (typeof globalThis !== 'undefined' && globalThis !== window) {
+            defineWritableFetch(globalThis);
+          }
+          // Prevent theme flash on page load
+          try {
+            var theme = localStorage.getItem('app_theme');
+            if (theme === 'dark' || (!theme && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+              document.documentElement.classList.add('dark');
+            }
+          } catch (e) {}
+        } catch (e) {
+          // Safeguard fallback
+        }
+      })();
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
   </head>
-  <body class="bg-slate-50 text-slate-900 antialiased selection:bg-emerald-500 selection:text-white">
+  <body class="bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 antialiased selection:bg-emerald-500 selection:text-white transition-colors duration-150">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

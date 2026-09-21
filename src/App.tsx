@@ -7,7 +7,8 @@ import {
   initialCustomers,
   initialDailyQueries
 } from './data/initialData';
-import { Customer, InventoryItem, Invoice, ReturnedProduct, ShopConfig, DailyOrderQuery } from './types';
+import { Customer, InventoryItem, Invoice, ReturnedProduct, ShopConfig, DailyOrderQuery, ActionLog, ActionCategory, LabelPrintReminder, LabelReminderStatus } from './types';
+import { getTodayNPTString, formatNPTTime, toBikramSambat } from './utils/nepalLocale';
 import { Header } from './components/Header';
 import { LowStockAlertBanner } from './components/LowStockAlertBanner';
 import { ExcelGridView } from './components/ExcelGridView';
@@ -17,7 +18,7 @@ import { CustomersManager } from './components/CustomersManager';
 import { ReturnsManager } from './components/ReturnsManager';
 import { MonthlyReportView } from './components/MonthlyReportView';
 import { DailyRecordsManager } from './components/DailyRecordsManager';
-import { BarcodeScannerModal } from './components/BarcodeScannerModal';
+import { BarcodeScannerModal, ScannedBatchEntry } from './components/BarcodeScannerModal';
 import { PaymentQrModal } from './components/PaymentQrModal';
 import { InvoiceModal } from './components/InvoiceModal';
 import { ScannedProductDashboardModal } from './components/ScannedProductDashboardModal';
@@ -26,9 +27,18 @@ import { QuickRestockModal } from './components/QuickRestockModal';
 import { AddProductCategoryModal } from './components/AddProductCategoryModal';
 import { CustomerDuesModal } from './components/CustomerDuesModal';
 import { OrderStatusUpdaterModal } from './components/OrderStatusUpdaterModal';
+import { MarketScoutModal } from './components/MarketScoutModal';
+import { LabelPrintReminderModal } from './components/LabelPrintReminderModal';
+import { StockBarcodeLabelModal } from './components/StockBarcodeLabelModal';
+import { GoogleCalendarManager } from './components/GoogleCalendarManager';
+import { TabKey } from './types';
 import { exportToExcelWorkbook, parseExcelInventoryFileWithReport } from './utils/excelEngine';
+import { findItemByBarcodeOrSku } from './utils/barcodeUtils';
+import { expandInventoryToIndividualUnits, generateBatchUniqueSkus, deduplicateAndSanitizeInventory } from './utils/skuGenerator';
 import { cloudSync, CloudStatusInfo } from './services/cloudSync';
+import { debounceSaveToStorage } from './utils/storageEngine';
 import { ToastProvider, useToast } from './components/Toast';
+import { ThemeProvider } from './context/ThemeContext';
 
 function RetailApp() {
   const toast = useToast();
@@ -40,7 +50,18 @@ function RetailApp() {
   // Application Data States (persisted locally in browser localStorage as offline-first cache)
   const [inventory, setInventory] = useState<InventoryItem[]>(() => {
     const saved = localStorage.getItem('gadget_inventory_master');
-    return saved ? JSON.parse(saved) : initialInventory;
+    if (saved) {
+      try {
+        const parsed: InventoryItem[] = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          // If any inventory item has grouped stock or duplicate IDs/SKUs, unpack and sanitize
+          return deduplicateAndSanitizeInventory(parsed);
+        }
+      } catch {
+        return deduplicateAndSanitizeInventory(initialInventory);
+      }
+    }
+    return deduplicateAndSanitizeInventory(initialInventory);
   });
 
   const [invoices, setInvoices] = useState<Invoice[]>(() => {
@@ -87,7 +108,18 @@ function RetailApp() {
 
   const [shopConfig, setShopConfig] = useState<ShopConfig>(() => {
     const saved = localStorage.getItem('gadget_shop_config');
-    return saved ? JSON.parse(saved) : initialShopConfig;
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (parsed.shopName === 'Remix Phone & Gadgets Hub' || !parsed.shopName) {
+          parsed.shopName = 'Welcome Mobile Zone';
+        }
+        return parsed;
+      } catch {
+        return initialShopConfig;
+      }
+    }
+    return initialShopConfig;
   });
 
   const [dailyQueries, setDailyQueries] = useState<DailyOrderQuery[]>(() => {
@@ -107,6 +139,18 @@ function RetailApp() {
     return initialDailyQueries;
   });
 
+  // Action Logs State (persistent in localStorage & real-time Firestore)
+  const [actionLogs, setActionLogs] = useState<ActionLog[]>(() => {
+    const saved = localStorage.getItem('gadget_action_logs_master');
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      } catch {}
+    }
+    return [];
+  });
+
   // Real-time Cloud Synchronization & Initial Seeding
   useEffect(() => {
     // Listen to cloud status for UI badge & diagnostics
@@ -120,7 +164,14 @@ function RetailApp() {
     // Listen to real-time cloud updates across all collections
     const unsubInv = cloudSync.subscribeInventory((cloudItems) => {
       if (cloudItems && cloudItems.length > 0) {
-        setInventory(cloudItems);
+        const cleaned = deduplicateAndSanitizeInventory(cloudItems);
+        setInventory(cleaned);
+        const hasGroupedOrDuplicates =
+          cloudItems.some((i) => i.stockQuantity > 1) ||
+          cloudItems.length !== cleaned.length;
+        if (hasGroupedOrDuplicates) {
+          cloudSync.bulkSaveInventory(cleaned);
+        }
       }
     });
 
@@ -154,6 +205,12 @@ function RetailApp() {
       }
     });
 
+    const unsubActionLogs = cloudSync.subscribeActionLogs((cloudLogs) => {
+      if (cloudLogs && cloudLogs.length > 0) {
+        setActionLogs(cloudLogs);
+      }
+    });
+
     return () => {
       unsubStatus();
       unsubInv();
@@ -162,36 +219,64 @@ function RetailApp() {
       unsubRet();
       unsubQueries();
       unsubConfig();
+      unsubActionLogs();
     };
   }, []);
 
-  // Sync to localStorage as offline-safe cache
+  // Auto-guarantee 1:1 physical unit SKU parity & unique IDs: every in-stock unit has its own unique SKU and ID
   useEffect(() => {
-    localStorage.setItem('gadget_inventory_master', JSON.stringify(inventory));
+    const hasGrouped = inventory.some((i) => i.stockQuantity > 1);
+    const seenIds = new Set<string>();
+    let hasDuplicateId = false;
+    for (const item of inventory) {
+      if (seenIds.has(item.id)) {
+        hasDuplicateId = true;
+        break;
+      }
+      seenIds.add(item.id);
+    }
+
+    if (hasGrouped || hasDuplicateId) {
+      const sanitized = deduplicateAndSanitizeInventory(inventory);
+      setInventory(sanitized);
+      cloudSync.bulkSaveInventory(sanitized);
+      try {
+        localStorage.setItem('gadget_inventory_master', JSON.stringify(sanitized));
+      } catch {}
+    }
+  }, [inventory]);
+
+  // Sync to localStorage as offline-safe cache with non-blocking debounce
+  useEffect(() => {
+    debounceSaveToStorage('gadget_inventory_master', inventory);
   }, [inventory]);
 
   useEffect(() => {
-    localStorage.setItem('gadget_invoices_master', JSON.stringify(invoices));
+    debounceSaveToStorage('gadget_invoices_master', invoices);
   }, [invoices]);
 
   useEffect(() => {
-    localStorage.setItem('gadget_customers_master', JSON.stringify(customers));
+    debounceSaveToStorage('gadget_customers_master', customers);
   }, [customers]);
 
   useEffect(() => {
-    localStorage.setItem('gadget_returns_master', JSON.stringify(returns));
+    debounceSaveToStorage('gadget_returns_master', returns);
   }, [returns]);
 
   useEffect(() => {
-    localStorage.setItem('gadget_daily_queries_master', JSON.stringify(dailyQueries));
+    debounceSaveToStorage('gadget_daily_queries_master', dailyQueries);
   }, [dailyQueries]);
 
   useEffect(() => {
-    localStorage.setItem('gadget_shop_config', JSON.stringify(shopConfig));
+    debounceSaveToStorage('gadget_shop_config', shopConfig);
   }, [shopConfig]);
 
+  useEffect(() => {
+    debounceSaveToStorage('gadget_action_logs_master', actionLogs);
+  }, [actionLogs]);
+
   // UI States
-  const [activeTab, setActiveTab] = useState<'daily' | 'excel' | 'inventory' | 'pos' | 'customers' | 'returns' | 'monthly'>('daily');
+  const [activeTab, setActiveTab] = useState<TabKey>('daily');
   const [posPreselectedCustomerId, setPosPreselectedCustomerId] = useState<string | null>(null);
   const [showScannerModal, setShowScannerModal] = useState(false);
 
@@ -205,6 +290,8 @@ function RetailApp() {
   const [prefillBarcodeForInventory, setPrefillBarcodeForInventory] = useState<string | null>(null);
   const [targetEditItemId, setTargetEditItemId] = useState<string | null>(null);
   const [initialCartItemForPos, setInitialCartItemForPos] = useState<InventoryItem | null>(null);
+  const [initialCartItemsForPos, setInitialCartItemsForPos] = useState<Array<{ item: InventoryItem; quantity?: number }> | null>(null);
+  const [initialReturnItem, setInitialReturnItem] = useState<InventoryItem | null>(null);
 
   // Active Checkout & Payment QR state
   const [pendingCheckout, setPendingCheckout] = useState<{
@@ -224,39 +311,354 @@ function RetailApp() {
   const [showAddProductCategoryModal, setShowAddProductCategoryModal] = useState(false);
   const [showCustomerDuesModal, setShowCustomerDuesModal] = useState(false);
   const [showOrderStatusUpdaterModal, setShowOrderStatusUpdaterModal] = useState(false);
+  const [showMarketScoutModal, setShowMarketScoutModal] = useState(false);
+  const [showLabelRemindersModal, setShowLabelRemindersModal] = useState(false);
+
+  // Barcode Label Studio Print Modal State
+  const [barcodeLabelStudioData, setBarcodeLabelStudioData] = useState<{
+    isOpen: boolean;
+    initialItem?: InventoryItem | null;
+    initialBatchItems?: InventoryItem[];
+    initialQuantity?: number;
+  } | null>(null);
+
+  // Print & Stickering Label Reminders Queue
+  const [labelReminders, setLabelReminders] = useState<LabelPrintReminder[]>(() => {
+    const saved = localStorage.getItem('gadget_label_reminders_master');
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      } catch {}
+    }
+    return [];
+  });
+
+  useEffect(() => {
+    debounceSaveToStorage('gadget_label_reminders_master', labelReminders);
+  }, [labelReminders]);
+
+  const handleAddLabelReminder = (reminder: Partial<LabelPrintReminder>) => {
+    const now = new Date();
+    const newReminder: LabelPrintReminder = {
+      id: `lbl-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      itemId: reminder.itemId || '',
+      itemName: reminder.itemName || 'Product',
+      brand: reminder.brand || '',
+      category: reminder.category || 'Smartphones',
+      sku: reminder.sku || '',
+      barcode: reminder.barcode || '',
+      sellingPrice: reminder.sellingPrice || 0,
+      costPrice: reminder.costPrice,
+      quantityNeeded: reminder.quantityNeeded || 1,
+      createdAt: now.toISOString(),
+      createdTime: formatNPTTime(now),
+      source: reminder.source || 'NEW_PRODUCT',
+      status: reminder.status || 'PENDING',
+      notes: reminder.notes,
+    };
+
+    setLabelReminders((prev) => [newReminder, ...prev]);
+
+    logAction({
+      category: 'PRODUCT',
+      actionTitle: `Queued Label: ${newReminder.itemName}`,
+      description: `Added ${newReminder.quantityNeeded} label(s) for ${newReminder.itemName} (SKU: ${newReminder.sku}, Price: रु ${newReminder.sellingPrice}) to printing and stickering queue.`,
+      source: 'PRODUCT_MODAL',
+      metadata: { reminderId: newReminder.id, sku: newReminder.sku, qty: newReminder.quantityNeeded },
+    });
+  };
+
+  const handleUpdateLabelStatus = (id: string, status: LabelReminderStatus, staffName?: string) => {
+    const now = new Date().toISOString();
+    setLabelReminders((prev) =>
+      prev.map((r) =>
+        r.id === id
+          ? {
+              ...r,
+              status,
+              ...(status === 'STICKERED'
+                ? { stickeredAt: now, stickeredBy: staffName || 'Counter Staff' }
+                : {}),
+            }
+          : r
+      )
+    );
+    if (status === 'STICKERED') {
+      toast.success('Marked label as stickered on physical inventory!', 'Stickering Done');
+    } else {
+      toast.info(`Updated label status to ${status}.`);
+    }
+  };
+
+  const handleBatchUpdateLabelStatus = (ids: string[], status: LabelReminderStatus, staffName?: string) => {
+    const idSet = new Set(ids);
+    const now = new Date().toISOString();
+    setLabelReminders((prev) =>
+      prev.map((r) =>
+        idSet.has(r.id)
+          ? {
+              ...r,
+              status,
+              ...(status === 'STICKERED'
+                ? { stickeredAt: now, stickeredBy: staffName || 'Counter Staff' }
+                : {}),
+            }
+          : r
+      )
+    );
+    if (status === 'STICKERED') {
+      toast.success(`Marked ${ids.length} items as printed & stickered!`, 'Stickering Done');
+    } else {
+      toast.info(`Updated ${ids.length} items to ${status}.`);
+    }
+  };
+
+  const handleDeleteLabelReminder = (reminderId: string) => {
+    setLabelReminders((prev) => prev.filter((r) => r.id !== reminderId));
+    toast.info('Removed label reminder.');
+  };
+
+  const handleClearStickeredLabels = () => {
+    setLabelReminders((prev) => prev.filter((r) => r.status !== 'STICKERED'));
+    toast.info('Cleared stickered labels history.');
+  };
+
+  const handleOpenLabelStudioFromReminders = (itemOrItems: {
+    singleItem?: InventoryItem;
+    batchItems?: InventoryItem[];
+    presetQty?: number;
+  }) => {
+    setBarcodeLabelStudioData({
+      isOpen: true,
+      initialItem: itemOrItems.singleItem || null,
+      initialBatchItems: itemOrItems.batchItems,
+      initialQuantity: itemOrItems.presetQty,
+    });
+  };
+
+  const pendingLabelRemindersCount = labelReminders.filter((r) => r.status === 'PENDING').length;
 
   // Hidden Excel upload input
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
+  // Master Action Logging Engine for All UI and Routine Actions
+  const logAction = (entry: {
+    category: ActionCategory;
+    actionTitle: string;
+    description: string;
+    staffName?: string;
+    source: ActionLog['source'];
+    status?: 'SUCCESS' | 'PENDING' | 'CANCELLED';
+    metadata?: Record<string, any>;
+  }) => {
+    const now = new Date();
+    const todayStr = getTodayNPTString();
+    const timeStr = formatNPTTime(now);
+    const bsInfo = toBikramSambat(todayStr);
+
+    const newLog: ActionLog = {
+      id: `act-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      timestamp: now.toISOString(),
+      date: todayStr,
+      time: timeStr,
+      bsDate: `${bsInfo.formattedNp} (${bsInfo.formattedBS})`,
+      category: entry.category,
+      actionTitle: entry.actionTitle,
+      description: entry.description,
+      staffName: entry.staffName || 'Counter Staff',
+      source: entry.source,
+      status: entry.status || 'SUCCESS',
+      metadata: entry.metadata || {},
+    };
+
+    setActionLogs((prev) => [newLog, ...prev]);
+    cloudSync.saveActionLog(newLog);
+    return newLog;
+  };
+
+  const handleClearActionLogs = () => {
+    setActionLogs([]);
+    localStorage.removeItem('gadget_action_logs_master');
+    cloudSync.clearAllActionLogs();
+    toast.info('Cleared all saved action logs.', 'Action Logs');
+  };
+
+  const handleDeleteActionLog = (logId: string) => {
+    setActionLogs((prev) => prev.filter((l) => l.id !== logId));
+    cloudSync.deleteActionLog(logId);
+    toast.info('Removed action log record.', 'Action Logs');
+  };
+
   // Calculate items with low stock (<= reorderLevel)
   const lowStockItems = inventory.filter((item) => item.stockQuantity <= item.reorderLevel);
 
-  // Handlers for Inventory with Deduplication & Cloud Sync
+  // Handlers for Inventory with SKU Uniqueness & Shared Barcode Support & Cloud Sync
   const handleAddItem = (newItem: InventoryItem) => {
+    // If newItem has stockQuantity > 1, unpack into exact individual unit items each with unique SKU
+    if (newItem.stockQuantity > 1) {
+      const expanded = expandInventoryToIndividualUnits([newItem]);
+      handleAddBatchItems(expanded);
+      return;
+    }
+
+    let duplicateSkuDetected = false;
     setInventory((prev) => {
-      const isDuplicate = prev.some(
-        (i) =>
-          i.id === newItem.id ||
-          (newItem.barcode && i.barcode.toLowerCase() === newItem.barcode.toLowerCase()) ||
-          (newItem.sku && i.sku.toLowerCase() === newItem.sku.toLowerCase())
+      // Check SKU Uniqueness (Strict rule: each item must have a unique SKU)
+      const existingWithSameSku = prev.find(
+        (i) => i.sku && newItem.sku && i.sku.trim().toLowerCase() === newItem.sku.trim().toLowerCase()
       );
-      if (isDuplicate) {
-        toast.warning(`Item "${newItem.name}" or barcode already exists in catalog.`);
+      if (existingWithSameSku) {
+        duplicateSkuDetected = true;
+        toast.error(`Duplicate SKU: "${newItem.sku}" already belongs to "${existingWithSameSku.name}". Each item must have a unique SKU!`, 'Duplicate SKU');
         return prev;
       }
       return [newItem, ...prev];
     });
+
+    if (duplicateSkuDetected) return;
+
     cloudSync.saveInventoryItem(newItem);
+
+    // Auto-queue sticker label printing reminder
+    handleAddLabelReminder({
+      itemId: newItem.id,
+      itemName: newItem.name,
+      brand: newItem.brand,
+      category: newItem.category,
+      sku: newItem.sku,
+      barcode: newItem.barcode,
+      sellingPrice: newItem.sellingPrice,
+      costPrice: newItem.costPrice,
+      quantityNeeded: newItem.stockQuantity > 0 ? newItem.stockQuantity : 1,
+      source: 'NEW_PRODUCT',
+      status: 'PENDING',
+    });
+
+    // Save audit log for future reference
+    logAction({
+      category: 'PRODUCT',
+      actionTitle: `Added Product: ${newItem.name}`,
+      description: `Created catalog product ${newItem.name} (SKU: ${newItem.sku}, Price: रु ${newItem.sellingPrice}, Barcode: ${newItem.barcode || 'N/A'}).`,
+      source: 'PRODUCT_MODAL',
+      metadata: {
+        itemId: newItem.id,
+        sku: newItem.sku,
+        barcode: newItem.barcode,
+        price: newItem.sellingPrice,
+        category: newItem.category,
+      },
+    });
+  };
+
+  const handleAddBatchItems = (newItems: InventoryItem[]) => {
+    if (!newItems || newItems.length === 0) return;
+    const addedItems: InventoryItem[] = [];
+
+    setInventory((prev) => {
+      const existingSkuSet = new Set(prev.map((i) => i.sku.trim().toLowerCase()));
+      for (const item of newItems) {
+        const itemSkuLower = item.sku.trim().toLowerCase();
+        if (!existingSkuSet.has(itemSkuLower)) {
+          addedItems.push(item);
+          existingSkuSet.add(itemSkuLower);
+        }
+      }
+
+      if (addedItems.length === 0) {
+        toast.warning('All items in batch were skipped due to duplicate SKUs.');
+        return prev;
+      }
+
+      return [...addedItems, ...prev];
+    });
+
+    if (addedItems.length === 0) return;
+
+    // Save added items to cloud and queue label reminders
+    addedItems.forEach((item) => {
+      cloudSync.saveInventoryItem(item);
+      handleAddLabelReminder({
+        itemId: item.id,
+        itemName: item.name,
+        brand: item.brand,
+        category: item.category,
+        sku: item.sku,
+        barcode: item.barcode,
+        sellingPrice: item.sellingPrice,
+        costPrice: item.costPrice,
+        quantityNeeded: 1,
+        source: 'NEW_PRODUCT',
+        status: 'PENDING',
+      });
+    });
+
+    logAction({
+      category: 'PRODUCT',
+      actionTitle: `Added Batch of ${addedItems.length} Units: ${addedItems[0]?.name}`,
+      description: `Added ${addedItems.length} individual units sharing barcode "${addedItems[0]?.barcode}" with unique SKUs.`,
+      source: 'PRODUCT_MODAL',
+      metadata: {
+        itemCount: addedItems.length,
+        sharedBarcode: addedItems[0]?.barcode,
+        firstSku: addedItems[0]?.sku,
+        lastSku: addedItems[addedItems.length - 1]?.sku,
+      },
+    });
+
+    toast.success(
+      `Successfully added batch of ${addedItems.length} items of "${addedItems[0]?.name}" with unique SKUs and shared barcode!`,
+      'Batch Items Registered'
+    );
+  };
+
+  const handleConvertAllToIndividualItems = () => {
+    setInventory((prev) => {
+      const expanded = deduplicateAndSanitizeInventory(prev);
+      cloudSync.bulkSaveInventory(expanded);
+      logAction({
+        category: 'PRODUCT',
+        actionTitle: 'Converted Stock to Individual Unit Registry',
+        description: `Expanded all inventory into ${expanded.length} individual items, each with a unique SKU and shared barcode.`,
+        source: 'PRODUCT_MODAL',
+      });
+      toast.success(
+        `All ${expanded.length} stock items are now registered as individual units with unique SKUs!`,
+        'Individual Units Active'
+      );
+      return expanded;
+    });
   };
 
   const handleUpdateItem = (updated: InventoryItem) => {
     setInventory((prev) => prev.map((i) => (i.id === updated.id ? updated : i)));
     cloudSync.saveInventoryItem(updated);
+    logAction({
+      category: 'INVENTORY_UPDATE',
+      actionTitle: `Updated Catalog: ${updated.name}`,
+      description: `Updated SKU ${updated.sku} (Selling: रु ${updated.sellingPrice}, Cost: रु ${updated.costPrice}, Stock: ${updated.stockQuantity} units, Reorder Level: ${updated.reorderLevel}).`,
+      source: 'PRODUCT_MODAL',
+      metadata: {
+        itemId: updated.id,
+        sku: updated.sku,
+        stockQuantity: updated.stockQuantity,
+        sellingPrice: updated.sellingPrice,
+        category: updated.category,
+      },
+    });
   };
 
   const handleDeleteItem = (itemId: string) => {
+    const target = inventory.find((i) => i.id === itemId);
     setInventory((prev) => prev.filter((i) => i.id !== itemId));
     cloudSync.deleteInventoryItem(itemId);
+    logAction({
+      category: 'INVENTORY_UPDATE',
+      actionTitle: `Removed Item: ${target?.name || itemId}`,
+      description: `Permanently removed ${target?.name || 'product'} (SKU: ${target?.sku || itemId}) from inventory database.`,
+      source: 'PRODUCT_MODAL',
+      metadata: { itemId, itemName: target?.name, sku: target?.sku },
+    });
   };
 
   const handleRestockQuantity = (
@@ -265,21 +667,148 @@ function RetailApp() {
     newCostPrice?: number, 
     supplier?: string
   ) => {
-    setInventory((prev) =>
-      prev.map((i) => {
-        if (i.id === itemId) {
-          const updatedItem = {
-            ...i,
-            stockQuantity: i.stockQuantity + addedQty,
-            costPrice: newCostPrice !== undefined && newCostPrice > 0 ? newCostPrice : i.costPrice,
-            supplier: supplier && supplier.trim() ? supplier.trim() : i.supplier,
+    let targetItemName = 'Inventory Item';
+    let targetItem: InventoryItem | undefined;
+
+    setInventory((prev) => {
+      const existing = prev.find((i) => i.id === itemId);
+      if (!existing) return prev;
+      targetItemName = existing.name;
+
+      const baseUpdated: InventoryItem = {
+        ...existing,
+        stockQuantity: 1,
+        costPrice: newCostPrice !== undefined && newCostPrice > 0 ? newCostPrice : existing.costPrice,
+        supplier: supplier && supplier.trim() ? supplier.trim() : existing.supplier,
+        lastRestockedDate: new Date().toISOString().split('T')[0],
+      };
+      targetItem = baseUpdated;
+      cloudSync.saveInventoryItem(baseUpdated);
+
+      // If existing item was sold (stockQuantity === 0), it now has 1 unit in stock, and we create (addedQty - 1) additional units
+      // If existing item already was in stock (stockQuantity >= 1), create all addedQty as new individual unit items
+      const unitsToCreate = existing.stockQuantity === 0 ? Math.max(0, addedQty - 1) : addedQty;
+      let newUnits: InventoryItem[] = [];
+
+      if (unitsToCreate > 0) {
+        const extraSkus = generateBatchUniqueSkus(
+          unitsToCreate,
+          existing.brand,
+          existing.category,
+          existing.name,
+          prev,
+          { isRestock: true, batchTag: 'RESTOCK' }
+        );
+        newUnits = extraSkus.map((sku, idx) => ({
+          ...baseUpdated,
+          id: `prod-restock-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
+          sku,
+          stockQuantity: 1,
+        }));
+        newUnits.forEach((u) => cloudSync.saveInventoryItem(u));
+      }
+
+      return [...newUnits, ...prev.map((i) => (i.id === itemId ? baseUpdated : i))];
+    });
+
+    // Auto-queue sticker label printing reminder for restocked units
+    if (targetItem) {
+      handleAddLabelReminder({
+        itemId: (targetItem as InventoryItem).id,
+        itemName: (targetItem as InventoryItem).name,
+        brand: (targetItem as InventoryItem).brand,
+        category: (targetItem as InventoryItem).category,
+        sku: (targetItem as InventoryItem).sku,
+        barcode: (targetItem as InventoryItem).barcode,
+        sellingPrice: (targetItem as InventoryItem).sellingPrice,
+        costPrice: (targetItem as InventoryItem).costPrice,
+        quantityNeeded: addedQty,
+        source: 'RESTOCK',
+        status: 'PENDING',
+      });
+    }
+
+    // Record action log for restock
+    logAction({
+      category: 'RESTOCK',
+      actionTitle: `Restocked ${targetItemName}`,
+      description: `Added +${addedQty} units to inventory stock. Supplier: ${supplier || 'Standard Distributor'}. Queued ${addedQty} labels for stickering.`,
+      source: 'RESTOCK_MODAL',
+      metadata: {
+        itemId,
+        itemName: targetItemName,
+        quantity: addedQty,
+        supplier,
+      },
+    });
+  };
+
+  const handleImportFromMarketScout = (itemsToImport: Partial<InventoryItem>[], sourceNotes: string) => {
+    let addedCount = 0;
+    let restockedCount = 0;
+
+    setInventory((prev) => {
+      const updated = [...prev];
+      itemsToImport.forEach((imported) => {
+        const matchIndex = updated.findIndex(
+          (i) =>
+            (imported.name && i.name.toLowerCase().trim() === imported.name.toLowerCase().trim()) ||
+            (imported.barcode && i.barcode && i.barcode.trim() === imported.barcode.trim())
+        );
+
+        if (matchIndex >= 0) {
+          const existing = updated[matchIndex];
+          const newQty = (existing.stockQuantity || 0) + (imported.stockQuantity || 5);
+          const updatedItem: InventoryItem = {
+            ...existing,
+            stockQuantity: newQty,
+            sellingPrice: imported.sellingPrice || existing.sellingPrice,
+            costPrice: imported.costPrice || existing.costPrice,
             lastRestockedDate: new Date().toISOString().split('T')[0],
           };
+          updated[matchIndex] = updatedItem;
           cloudSync.saveInventoryItem(updatedItem);
-          return updatedItem;
+          restockedCount++;
+        } else {
+          const newItem: InventoryItem = {
+            id: `prod-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            name: imported.name || 'Trending Tech Item',
+            brand: imported.brand || 'Generic',
+            category: (imported.category as any) || 'Accessories',
+            sku: imported.sku || `SKU-${Date.now().toString().slice(-4)}`,
+            barcode: imported.barcode || `${Date.now()}`,
+            costPrice: imported.costPrice || 100,
+            sellingPrice: imported.sellingPrice || 150,
+            stockQuantity: imported.stockQuantity || 5,
+            reorderLevel: imported.reorderLevel || 3,
+            supplier: imported.supplier || 'Market Scout Wholesale',
+            imeiRequired: Boolean(imported.imeiRequired),
+            lastRestockedDate: new Date().toISOString().split('T')[0],
+          };
+          updated.unshift(newItem);
+          cloudSync.saveInventoryItem(newItem);
+          addedCount++;
         }
-        return i;
-      })
+      });
+
+      return updated;
+    });
+
+    logAction({
+      category: 'MARKET_SCOUT',
+      actionTitle: `Market Scout Import (${itemsToImport.length} Items)`,
+      description: `${sourceNotes}. Added ${addedCount} new catalog items, restocked ${restockedCount} existing products.`,
+      source: 'MARKET_SCOUT',
+      metadata: {
+        totalImported: itemsToImport.length,
+        newItemsAdded: addedCount,
+        existingRestocked: restockedCount,
+      },
+    });
+
+    toast.success(
+      `Synchronized ${itemsToImport.length} products (${addedCount} new added, ${restockedCount} restocked)!`,
+      'Market Scout Sync'
     );
   };
 
@@ -290,9 +819,11 @@ function RetailApp() {
     paymentMethod: string, 
     notes?: string
   ) => {
+    let customerName = 'Customer';
     setCustomers((prev) =>
       prev.map((c) => {
         if (c.id === customerId) {
+          customerName = c.name;
           const currentDue = c.dueAmount || 0;
           const newDue = Math.max(0, currentDue - amountSettled);
           const logNote = `Settled रु ${amountSettled} via ${paymentMethod}${notes ? ` (${notes})` : ''}`;
@@ -307,6 +838,21 @@ function RetailApp() {
         return c;
       })
     );
+
+    // Record action log for credit settlement
+    logAction({
+      category: 'DUE_SETTLEMENT',
+      actionTitle: `Settled Customer Due: ${customerName}`,
+      description: `Received payment of रु ${amountSettled} via ${paymentMethod} to clear due balance. ${notes || ''}`,
+      source: 'DUES_MODAL',
+      metadata: {
+        customerId,
+        customerName,
+        amount: amountSettled,
+        paymentMethod,
+        notes,
+      },
+    });
   };
 
   const handleAddCustomerCredit = (
@@ -314,9 +860,11 @@ function RetailApp() {
     creditAmount: number, 
     reason?: string
   ) => {
+    let customerName = 'Customer';
     setCustomers((prev) =>
       prev.map((c) => {
         if (c.id === customerId) {
+          customerName = c.name;
           const currentDue = (c.dueAmount || 0) + creditAmount;
           const logNote = `Credit +रु ${creditAmount}${reason ? `: ${reason}` : ''}`;
           const updatedCustomer: Customer = {
@@ -330,6 +878,20 @@ function RetailApp() {
         return c;
       })
     );
+
+    // Record action log for credit addition
+    logAction({
+      category: 'CREDIT_ENTRY',
+      actionTitle: `Added Credit (उधारो): ${customerName}`,
+      description: `Extended store credit of रु ${creditAmount} to ${customerName}. Reason: ${reason || 'Store credit purchase'}.`,
+      source: 'DUES_MODAL',
+      metadata: {
+        customerId,
+        customerName,
+        amount: creditAmount,
+        reason,
+      },
+    });
   };
 
   // Handlers for Customer CRM & Loyalty with Deduplication & Cloud Sync
@@ -346,16 +908,48 @@ function RetailApp() {
       return [newCustomer, ...prev];
     });
     cloudSync.saveCustomer(newCustomer);
+    logAction({
+      category: 'CUSTOMER',
+      actionTitle: `Enrolled Customer: ${newCustomer.name}`,
+      description: `Registered new CRM account for ${newCustomer.name} (Phone: ${newCustomer.phone}, Tier: ${newCustomer.tier}, Loyalty: ${newCustomer.loyaltyPoints} pts).`,
+      source: 'POS_TERMINAL',
+      metadata: {
+        customerId: newCustomer.id,
+        customerName: newCustomer.name,
+        phone: newCustomer.phone,
+        tier: newCustomer.tier,
+      },
+    });
   };
 
   const handleUpdateCustomer = (updated: Customer) => {
     setCustomers((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
     cloudSync.saveCustomer(updated);
+    logAction({
+      category: 'CUSTOMER',
+      actionTitle: `Updated Customer: ${updated.name}`,
+      description: `Updated profile details for ${updated.name} (Phone: ${updated.phone}, Due Balance: रु ${updated.dueAmount || 0}, Tier: ${updated.tier}).`,
+      source: 'MANUAL',
+      metadata: {
+        customerId: updated.id,
+        customerName: updated.name,
+        dueAmount: updated.dueAmount,
+        loyaltyPoints: updated.loyaltyPoints,
+      },
+    });
   };
 
   const handleDeleteCustomer = (customerId: string) => {
+    const target = customers.find((c) => c.id === customerId);
     setCustomers((prev) => prev.filter((c) => c.id !== customerId));
     cloudSync.deleteCustomer(customerId);
+    logAction({
+      category: 'CUSTOMER',
+      actionTitle: `Deleted Customer: ${target?.name || customerId}`,
+      description: `Permanently removed customer profile ${target?.name || ''} from database.`,
+      source: 'MANUAL',
+      metadata: { customerId, customerName: target?.name },
+    });
   };
 
   const handleAdjustCustomerPoints = (customerId: string, delta: number, reason?: string) => {
@@ -377,6 +971,22 @@ function RetailApp() {
             notes: (c.notes || '') + noteAddition,
           };
           cloudSync.saveCustomer(updated);
+
+          logAction({
+            category: 'CUSTOMER',
+            actionTitle: `Adjusted Loyalty Points: ${c.name}`,
+            description: `${delta > 0 ? 'Awarded +' : 'Deducted '}${delta} loyalty points to ${c.name}. Reason: ${reason || 'Manual Adjustment'}. New balance: ${newPoints} pts (${tier} Tier).`,
+            source: 'MANUAL',
+            metadata: {
+              customerId: c.id,
+              customerName: c.name,
+              delta,
+              newPoints,
+              tier,
+              reason,
+            },
+          });
+
           return updated;
         }
         return c;
@@ -480,6 +1090,21 @@ function RetailApp() {
 
     // Open printable tax invoice
     setActiveInvoiceForModal(inv);
+
+    // Save action log for new retail sale
+    logAction({
+      category: 'SALE',
+      actionTitle: `New Retail Sale: #${inv.invoiceNumber}`,
+      description: `Completed sale of रु ${inv.grandTotal} (${inv.items.length} items) for ${inv.customerName} via ${inv.paymentMethod}.`,
+      source: 'POS_TERMINAL',
+      metadata: {
+        invoiceNumber: inv.invoiceNumber,
+        amount: inv.grandTotal,
+        customerName: inv.customerName,
+        paymentMethod: inv.paymentMethod,
+        itemsCount: inv.items.length,
+      },
+    });
   };
 
   const handleQrPaymentConfirmed = (transactionRef: string) => {
@@ -503,6 +1128,20 @@ function RetailApp() {
       return [newReturn, ...prev];
     });
     cloudSync.saveReturn(newReturn);
+
+    // Record action log for customer return
+    logAction({
+      category: 'RETURN_RMA',
+      actionTitle: `Processed Return: ${newReturn.itemName}`,
+      description: `Customer ${newReturn.customerName} returned ${newReturn.itemName}. Refund: रु ${newReturn.refundAmount}. Reason: ${newReturn.returnReason}. Restocked: ${shouldRestock ? 'Yes' : 'No'}.`,
+      source: 'MANUAL',
+      metadata: {
+        returnId: newReturn.id,
+        itemName: newReturn.itemName,
+        refundAmount: newReturn.refundAmount,
+        customerName: newReturn.customerName,
+      },
+    });
 
     if (shouldRestock) {
       if (itemId && inventory.some((i) => i.id === itemId)) {
@@ -534,14 +1173,44 @@ function RetailApp() {
     }
   };
 
+  const handleUpdateReturn = (updated: ReturnedProduct) => {
+    setReturns((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+    cloudSync.saveReturn(updated);
+    toast.success(`Updated Return & Warranty record #${updated.id}`);
+
+    logAction({
+      category: 'RETURN_RMA',
+      actionTitle: `Updated Warranty / RMA #${updated.id}`,
+      description: `Claim for ${updated.itemName} resolution set to ${updated.resolution || updated.actionTaken}, status: ${updated.status || 'UPDATED'}. Warranty: ${updated.warrantyStatus}.`,
+      source: 'MANUAL',
+      metadata: {
+        returnId: updated.id,
+        resolution: updated.resolution,
+        warrantyStatus: updated.warrantyStatus,
+      },
+    });
+  };
+
+  const handleDeleteReturn = (returnId: string) => {
+    setReturns((prev) => prev.filter((r) => r.id !== returnId));
+    cloudSync.deleteReturn(returnId);
+    toast.info(`Deleted Return / RMA ticket #${returnId}`);
+
+    logAction({
+      category: 'RETURN_RMA',
+      actionTitle: `Deleted Return Ticket #${returnId}`,
+      description: `RMA record #${returnId} was permanently removed.`,
+      source: 'MANUAL',
+      metadata: { returnId },
+    });
+  };
+
   // Barcode Detected handler: launches the requested Post-Scan Dashboard
   const handleBarcodeDetected = (barcode: string, foundItem?: InventoryItem) => {
+    setShowScannerModal(false);
     const resolvedItem =
       foundItem ||
-      inventory.find(
-        (i) => i.barcode === barcode || i.sku.toLowerCase() === barcode.toLowerCase()
-      ) ||
-      null;
+      findItemByBarcodeOrSku(inventory, barcode);
 
     setScannedDashboardData({
       scannedCode: barcode,
@@ -561,6 +1230,21 @@ function RetailApp() {
     setScannedDashboardData(null);
     setInitialCartItemForPos(item);
     setActiveTab('pos');
+  };
+
+  // Add multiple scanned batch items directly into Current Sales & Bills
+  const handleAddBatchToBill = (batch: ScannedBatchEntry[]) => {
+    if (!batch || batch.length === 0) return;
+    setInitialCartItemsForPos(batch.map((b) => ({ item: b.item, quantity: b.quantity })));
+    toast.success(`Added ${batch.reduce((s, b) => s + b.quantity, 0)} scanned items to Current Sales & Bills.`);
+  };
+
+  // Sell entire multi-scanned batch in POS Billing View
+  const handleSellBatchInPos = (batch: ScannedBatchEntry[]) => {
+    if (!batch || batch.length === 0) return;
+    setInitialCartItemsForPos(batch.map((b) => ({ item: b.item, quantity: b.quantity })));
+    setActiveTab('pos');
+    toast.success(`Loaded ${batch.reduce((s, b) => s + b.quantity, 0)} scanned items into POS Cart.`);
   };
 
   // Edit item in inventory
@@ -643,12 +1327,41 @@ function RetailApp() {
     setDailyQueries((prev) => [newQuery, ...prev]);
     cloudSync.saveDailyQuery(newQuery);
     toast.success(`Logged note/query for ${newQuery.customerName}`, 'Daily Records');
+
+    // Record action log
+    logAction({
+      category: 'ORDER_UPDATE',
+      actionTitle: `Logged Inquiry: ${newQuery.customerName}`,
+      description: `Inquiry registered for ${newQuery.deviceModel} (${newQuery.queryType}, Priority: ${newQuery.priority}).`,
+      source: 'ORDER_MODAL',
+      metadata: {
+        queryId: newQuery.id,
+        customerName: newQuery.customerName,
+        deviceModel: newQuery.deviceModel,
+        queryType: newQuery.queryType,
+        priority: newQuery.priority,
+      },
+    });
   };
 
   const handleUpdateDailyQuery = (updated: DailyOrderQuery) => {
     setDailyQueries((prev) => prev.map((q) => (q.id === updated.id ? updated : q)));
     cloudSync.saveDailyQuery(updated);
     toast.info(`Updated status for ${updated.customerName}`, 'Daily Records');
+
+    // Record action log
+    logAction({
+      category: 'ORDER_UPDATE',
+      actionTitle: `Updated Order Status: ${updated.customerName}`,
+      description: `Status marked as "${updated.status}" for ${updated.deviceModel}. ${updated.resolutionNotes || updated.notes}`,
+      source: 'ORDER_MODAL',
+      metadata: {
+        queryId: updated.id,
+        customerName: updated.customerName,
+        deviceModel: updated.deviceModel,
+        status: updated.status,
+      },
+    });
   };
 
   const handleDeleteDailyQuery = (queryId: string) => {
@@ -707,7 +1420,7 @@ function RetailApp() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col">
+    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex flex-col transition-colors duration-150">
       {/* Hidden Excel Import File Input */}
       <input
         type="file"
@@ -730,6 +1443,9 @@ function RetailApp() {
         onExportExcel={() => exportToExcelWorkbook(inventory, invoices, returns, shopConfig, undefined, customers)}
         onImportExcel={() => fileInputRef.current?.click()}
         onOpenScanner={() => setShowScannerModal(true)}
+        onOpenMarketScout={() => setShowMarketScoutModal(true)}
+        onOpenLabelReminders={() => setShowLabelRemindersModal(true)}
+        pendingLabelRemindersCount={pendingLabelRemindersCount}
       />
 
       {/* Low Stock Alert Banner (Visible when any product reaches/falls below reorder threshold) */}
@@ -747,16 +1463,69 @@ function RetailApp() {
             inventory={inventory}
             customers={customers}
             queries={dailyQueries}
+            returns={returns}
+            shopConfig={shopConfig}
+            actionLogs={actionLogs}
+            onLogAction={logAction}
+            onClearActionLogs={handleClearActionLogs}
+            onDeleteActionLog={handleDeleteActionLog}
             onAddQuery={handleAddDailyQuery}
             onUpdateQuery={handleUpdateDailyQuery}
             onDeleteQuery={handleDeleteDailyQuery}
             onViewInvoice={(inv) => setActiveInvoiceForModal(inv)}
             onNavigateToPosWithCustomer={handleNavigateToPosWithCustomer}
-            onOpenNewSale={() => setActiveTab('pos')}
-            onOpenRestock={() => setShowQuickRestockModal(true)}
-            onOpenAddProductCategory={() => setShowAddProductCategoryModal(true)}
-            onOpenCustomerDues={() => setShowCustomerDuesModal(true)}
-            onOpenOrderStatusUpdater={() => setShowOrderStatusUpdaterModal(true)}
+            onOpenNewSale={() => {
+              logAction({
+                category: 'ROUTINE_LAUNCH',
+                actionTitle: 'Launched New Sale (POS Terminal)',
+                description: 'Opened POS terminal cashier for retail bill checkout & QR payments.',
+                source: 'DAILY_ROUTINE_BAR',
+                metadata: { view: 'pos' },
+              });
+              setActiveTab('pos');
+            }}
+            onOpenRestock={() => {
+              logAction({
+                category: 'ROUTINE_LAUNCH',
+                actionTitle: 'Opened Quick Restock Console',
+                description: `Accessed restock console (${lowStockItems.length} low stock items).`,
+                source: 'DAILY_ROUTINE_BAR',
+                metadata: { lowStockCount: lowStockItems.length },
+              });
+              setShowQuickRestockModal(true);
+            }}
+            onOpenAddProductCategory={() => {
+              logAction({
+                category: 'ROUTINE_LAUNCH',
+                actionTitle: 'Opened Product & Category Creator',
+                description: 'Accessed catalog creation tool for new SKU/barcode products and categories.',
+                source: 'DAILY_ROUTINE_BAR',
+              });
+              setShowAddProductCategoryModal(true);
+            }}
+            onOpenCustomerDues={() => {
+              const duesCount = customers.filter((c) => (c.dueAmount || 0) > 0).length;
+              logAction({
+                category: 'ROUTINE_LAUNCH',
+                actionTitle: 'Opened Customer Dues Ledger (उधारो)',
+                description: `Accessed customer credit tracking (${duesCount} customers with active dues).`,
+                source: 'DAILY_ROUTINE_BAR',
+              });
+              setShowCustomerDuesModal(true);
+            }}
+            onOpenOrderStatusUpdater={() => {
+              const pendingCount = dailyQueries.filter((q) => q.status === 'PENDING').length;
+              logAction({
+                category: 'ROUTINE_LAUNCH',
+                actionTitle: 'Opened Order Status & Customer Inquiries',
+                description: `Accessed order inquiries manager (${pendingCount} pending customer requests).`,
+                source: 'DAILY_ROUTINE_BAR',
+              });
+              setShowOrderStatusUpdaterModal(true);
+            }}
+            onOpenLabelReminders={() => setShowLabelRemindersModal(true)}
+            onOpenGoogleCalendar={() => setActiveTab('calendar')}
+            pendingLabelRemindersCount={pendingLabelRemindersCount}
             onExportDailySheet={(date, dayInvoices) => {
               exportToExcelWorkbook(inventory, dayInvoices, returns, shopConfig, undefined, customers);
               toast.success(`Exported daily spreadsheet report for ${date}`, 'Spreadsheet Export');
@@ -773,21 +1542,46 @@ function RetailApp() {
             onUpdateItem={handleUpdateItem}
             onAddItem={() => setActiveTab('inventory')}
             onImportClick={() => fileInputRef.current?.click()}
+            onOpenInvoice={(inv) => setActiveInvoiceForModal(inv)}
+            onAddReturn={handleAddReturn}
+            onUpdateReturn={handleUpdateReturn}
+            onDeleteReturn={handleDeleteReturn}
           />
         )}
 
         {activeTab === 'inventory' && (
           <InventoryManager
             inventory={inventory}
+            invoices={invoices}
+            onConvertAllToIndividualItems={handleConvertAllToIndividualItems}
             onAddItem={handleAddItem}
+            onAddBatchItems={handleAddBatchItems}
             onUpdateItem={handleUpdateItem}
             onDeleteItem={handleDeleteItem}
             onOpenScanner={() => setShowScannerModal(true)}
+            onOpenMarketScout={() => setShowMarketScoutModal(true)}
+            onOpenLabelReminders={() => setShowLabelRemindersModal(true)}
+            pendingLabelRemindersCount={pendingLabelRemindersCount}
+            onAddLabelReminder={handleAddLabelReminder}
             shopConfig={shopConfig}
             prefilledBarcodeForNewItem={prefillBarcodeForInventory}
             onClearPrefilledBarcode={() => setPrefillBarcodeForInventory(null)}
             targetEditItemId={targetEditItemId}
             onClearTargetEditItemId={() => setTargetEditItemId(null)}
+            onOpenRestock={(item) => {
+              if (item) {
+                setScannedDashboardData({
+                  scannedCode: item.barcode || item.sku,
+                  item,
+                });
+              }
+            }}
+            onOpenReturn={(item) => {
+              if (item) {
+                setInitialReturnItem(item);
+                setActiveTab('returns');
+              }
+            }}
           />
         )}
 
@@ -803,7 +1597,11 @@ function RetailApp() {
             onOpenInvoice={(inv) => setActiveInvoiceForModal(inv)}
             onAddCustomer={handleAddCustomer}
             initialCartItemToAdd={initialCartItemForPos}
-            onClearInitialCartItemToAdd={() => setInitialCartItemForPos(null)}
+            initialCartItemsToAdd={initialCartItemsForPos}
+            onClearInitialCartItemToAdd={() => {
+              setInitialCartItemForPos(null);
+              setInitialCartItemsForPos(null);
+            }}
           />
         )}
 
@@ -828,6 +1626,8 @@ function RetailApp() {
             invoices={invoices}
             onAddReturn={handleAddReturn}
             onOpenScanner={() => setShowScannerModal(true)}
+            initialReturnItem={initialReturnItem}
+            onClearInitialReturnItem={() => setInitialReturnItem(null)}
           />
         )}
 
@@ -839,15 +1639,25 @@ function RetailApp() {
             shopConfig={shopConfig}
           />
         )}
+
+        {activeTab === 'calendar' && (
+          <GoogleCalendarManager
+            inventory={inventory}
+            customers={customers}
+            dailyQueries={dailyQueries}
+          />
+        )}
       </main>
 
       {/* Modals */}
-      {/* 1. Barcode Scanner & Reader (Camera + Laser Gun listener) */}
+      {/* 1. Barcode Scanner & Reader (Continuous Multi-Scan Camera + Laser Gun listener) */}
       <BarcodeScannerModal
         isOpen={showScannerModal}
         onClose={() => setShowScannerModal(false)}
         inventory={inventory}
         onBarcodeDetected={handleBarcodeDetected}
+        onAddItemsToBill={handleAddBatchToBill}
+        onSellInPos={handleSellBatchInPos}
       />
 
       {/* 2. Dynamic Billing Amount QR Code Generator Modal */}
@@ -885,7 +1695,20 @@ function RetailApp() {
           onSellInPos={handleSellScannedItemInPos}
           onRestockItem={handleRestockQuantity}
           onEditInInventory={handleEditScannedItemInInventory}
+          onProcessReturn={(item) => {
+            setScannedDashboardData(null);
+            setInitialReturnItem(item);
+            setActiveTab('returns');
+          }}
           onScanAnother={handleScanAnother}
+          onOpenLabelStudio={(item) => {
+            setScannedDashboardData(null);
+            setBarcodeLabelStudioData({
+              isOpen: true,
+              initialItem: item,
+              initialQuantity: item.stockQuantity || 1,
+            });
+          }}
           onViewInvoice={(inv) => {
             setScannedDashboardData(null);
             setActiveInvoiceForModal(inv);
@@ -898,9 +1721,13 @@ function RetailApp() {
         isOpen={showCloudSyncModal}
         status={cloudStatus}
         onClose={() => setShowCloudSyncModal(false)}
-        onForceRefresh={() => {
-          cloudSync.seedInitialDataIfEmpty(inventory, invoices, customers, returns, dailyQueries, shopConfig);
-          toast.info('Initiated cloud synchronizer check.', 'Cloud Sync');
+        onForceRefresh={async () => {
+          const res = await cloudSync.reconnect();
+          if (res.success) {
+            toast.success(res.message, 'Cloud Firestore Live');
+          } else {
+            toast.info('Cloud synchronizer is re-establishing stream in background.', 'Cloud Sync');
+          }
         }}
       />
 
@@ -918,7 +1745,21 @@ function RetailApp() {
         onClose={() => setShowAddProductCategoryModal(false)}
         inventory={inventory}
         onAddProduct={handleAddItem}
+        onAddBatchProducts={handleAddBatchItems}
+        onUpdateProduct={handleUpdateItem}
+        onAddLabelReminder={handleAddLabelReminder}
+        onOpenRestock={(item) => {
+          setScannedDashboardData({
+            scannedCode: item.barcode || item.sku,
+            item,
+          });
+        }}
+        onOpenReturn={(item) => {
+          setInitialReturnItem(item);
+          setActiveTab('returns');
+        }}
         onOpenScanner={() => setShowScannerModal(true)}
+        onLogAction={logAction}
       />
 
       {/* 8. Daily Routine: Customer Dues & Credit Management Ledger Modal */}
@@ -941,14 +1782,59 @@ function RetailApp() {
         onAddNewQuery={handleAddDailyQuery}
         onConvertToSale={handleConvertOrderQueryToSale}
       />
+
+      {/* 10. AI Market Trends & Sourcing Scout Modal */}
+      <MarketScoutModal
+        isOpen={showMarketScoutModal}
+        onClose={() => setShowMarketScoutModal(false)}
+        existingInventory={inventory}
+        onImportItems={handleImportFromMarketScout}
+      />
+
+      {/* 11. Barcode Label Generation, Print Preview & Stickering Reminder Queue Modal */}
+      <LabelPrintReminderModal
+        isOpen={showLabelRemindersModal}
+        onClose={() => setShowLabelRemindersModal(false)}
+        reminders={labelReminders}
+        inventory={inventory}
+        shopConfig={shopConfig}
+        onUpdateStatus={handleUpdateLabelStatus}
+        onBatchUpdateStatus={handleBatchUpdateLabelStatus}
+        onDeleteReminder={handleDeleteLabelReminder}
+        onClearStickered={handleClearStickeredLabels}
+        onOpenLabelStudio={handleOpenLabelStudioFromReminders}
+      />
+
+      {/* 12. Stock Barcode Label Generator, Print Preview & Studio Modal */}
+      {barcodeLabelStudioData && (
+        <StockBarcodeLabelModal
+          isOpen={barcodeLabelStudioData.isOpen}
+          onClose={() => setBarcodeLabelStudioData(null)}
+          initialItem={barcodeLabelStudioData.initialItem}
+          initialBatchItems={barcodeLabelStudioData.initialBatchItems}
+          initialQuantity={barcodeLabelStudioData.initialQuantity}
+          inventory={inventory}
+          shopConfig={shopConfig}
+          onMarkStickered={(itemIds) => {
+            const matchingReminderIds = labelReminders
+              .filter((r) => itemIds.includes(r.itemId) || itemIds.includes(r.sku))
+              .map((r) => r.id);
+            if (matchingReminderIds.length > 0) {
+              handleBatchUpdateLabelStatus(matchingReminderIds, 'STICKERED', 'Counter Staff');
+            }
+          }}
+        />
+      )}
     </div>
   );
 }
 
 export default function App() {
   return (
-    <ToastProvider>
-      <RetailApp />
-    </ToastProvider>
+    <ThemeProvider>
+      <ToastProvider>
+        <RetailApp />
+      </ToastProvider>
+    </ThemeProvider>
   );
 }

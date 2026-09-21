@@ -178,67 +178,94 @@ export function exportToExcelWorkbook(
   XLSX.utils.book_append_sheet(wb, wsSales, 'Sales_Transactions');
 
   // -------------------------------------------------------------
-  // Sheet 3: Returns & RMA Identification
+  // Sheet 3: Returns & Warranty Ledger (Nepalese Standard)
   // -------------------------------------------------------------
   const returnHeaders = [
     'RMA Ticket ID',
     'Date Returned',
-    'Orig Invoice #',
-    'Item Barcode',
-    'Product Name',
+    'Orig Sale Invoice #',
+    'Purchase Date',
+    'Days Elapsed Formula',
+    'Product Description',
     'Brand',
+    'Item Barcode',
     'Serial / IMEI',
     'Customer Name',
-    'Phone',
+    'Customer Phone',
+    'Customer Email',
     'Return Reason',
-    'Device Condition',
-    'Action Taken',
-    'Refund Amount (रु)',
+    'Warranty Status',
+    'Warranty Check Formula',
+    'Resolution (e.g. Refund/Exchange/Repair)',
+    'Amount / Fee (रु)',
     'Restocked to Shelf?',
-    'Notes',
+    'RMA Stage',
+    'Resolution Notes',
   ];
 
   const returnRows: any[][] = [returnHeaders];
 
-  returns.forEach((r) => {
+  returns.forEach((r, idx) => {
+    const rowNum = idx + 2;
+    const daysFormula = r.purchaseDate
+      ? { f: `=IF(ISBLANK(D${rowNum}),"N/A",DATEDIF(D${rowNum},B${rowNum},"D")&" days")`, v: 'Checked' }
+      : 'N/A';
+    const warrantyFormula = r.purchaseDate
+      ? { f: `=IF(ISBLANK(D${rowNum}),"UNKNOWN",IF(TODAY()-DATEVALUE(D${rowNum})<=365,"UNDER WARRANTY","EXPIRED"))`, v: r.warrantyStatus || 'UNDER_WARRANTY' }
+      : r.warrantyStatus || 'UNDER_WARRANTY';
+
+    const resolutionType = 
+      r.resolution || 
+      (r.actionTaken === 'REPLACED' ? 'EXCHANGE' : r.actionTaken === 'REPAIRED' ? 'REPAIR' : r.actionTaken === 'STORE_CREDIT' ? 'STORE_CREDIT' : 'REFUND');
+
     returnRows.push([
       r.id,
       r.returnDate,
       r.invoiceNumber,
-      r.itemBarcode,
+      r.purchaseDate || 'N/A',
+      daysFormula,
       r.itemName,
       r.itemBrand,
+      r.itemBarcode,
       r.serialOrImei || 'N/A',
       r.customerName,
       r.customerPhone,
+      r.customerEmail || '',
       r.returnReason,
-      r.condition,
-      r.actionTaken,
-      r.refundAmount,
+      r.warrantyStatus || 'UNDER_WARRANTY',
+      warrantyFormula,
+      resolutionType,
+      r.refundAmount > 0 ? r.refundAmount : (r.repairCost || 0),
       r.restockedToInventory ? 'YES' : 'NO',
+      r.status || 'RESOLVED',
       r.notes || '',
     ]);
   });
 
   const wsReturns = XLSX.utils.aoa_to_sheet(returnRows);
   wsReturns['!cols'] = [
-    { wch: 18 },
-    { wch: 18 },
-    { wch: 18 },
-    { wch: 18 },
-    { wch: 35 },
-    { wch: 14 },
-    { wch: 20 },
-    { wch: 20 },
-    { wch: 16 },
-    { wch: 20 },
-    { wch: 18 },
-    { wch: 16 },
-    { wch: 18 },
-    { wch: 16 },
-    { wch: 35 },
+    { wch: 18 }, // RMA ID
+    { wch: 16 }, // Return Date
+    { wch: 20 }, // Orig Sale Invoice
+    { wch: 16 }, // Purchase Date
+    { wch: 20 }, // Days Formula
+    { wch: 36 }, // Product Description
+    { wch: 14 }, // Brand
+    { wch: 18 }, // Barcode
+    { wch: 20 }, // Serial / IMEI
+    { wch: 20 }, // Customer Name
+    { wch: 16 }, // Customer Phone
+    { wch: 22 }, // Customer Email
+    { wch: 22 }, // Return Reason
+    { wch: 18 }, // Warranty Status
+    { wch: 24 }, // Warranty Check Formula
+    { wch: 20 }, // Resolution
+    { wch: 16 }, // Amount
+    { wch: 16 }, // Restocked
+    { wch: 14 }, // RMA Stage
+    { wch: 38 }, // Notes
   ];
-  XLSX.utils.book_append_sheet(wb, wsReturns, 'Returns_RMA_Log');
+  XLSX.utils.book_append_sheet(wb, wsReturns, 'Returns_and_Warranty');
 
   // -------------------------------------------------------------
   // Sheet 4: Performance Report (Nepalese Standard)
@@ -650,6 +677,85 @@ export function importExcelToInventory(fileBuffer: ArrayBuffer): {
     skippedEmptyRows,
     totalParsed: jsonData.length,
   };
+}
+
+/**
+ * Export all day and monthly action & transaction logs to a dedicated Excel workbook (.xlsx)
+ */
+export function exportActionLogsToExcelWorkbook(
+  logs: any[],
+  shopConfig: ShopConfig,
+  scopeLabel = 'All_Day_Records'
+) {
+  const wb = XLSX.utils.book_new();
+
+  const headers = [
+    'Log ID',
+    'Date (AD)',
+    'Date (BS Bikram Sambat)',
+    'Time (NPT)',
+    'Category',
+    'Action Title',
+    'Full Description',
+    'Staff / Operator',
+    'Status',
+    'Source Channel',
+    'Invoice Number',
+    'Customer Name',
+    'Customer Phone',
+    'Amount (रु)',
+    'Payment Method',
+    'Item / SKU',
+    'Quantity',
+  ];
+
+  const rows: any[][] = [headers];
+
+  logs.forEach((log) => {
+    rows.push([
+      log.id || '',
+      log.date || '',
+      log.bsDate || '',
+      log.time || '',
+      log.category || '',
+      log.actionTitle || '',
+      log.description || '',
+      log.staffName || '',
+      log.status || 'SUCCESS',
+      log.source || '',
+      log.metadata?.invoiceNumber || '',
+      log.metadata?.customerName || '',
+      log.metadata?.phone || log.metadata?.customerPhone || '',
+      log.metadata?.amount || log.metadata?.grandTotal || '',
+      log.metadata?.paymentMethod || '',
+      log.metadata?.itemName || log.metadata?.sku || '',
+      log.metadata?.quantity || '',
+    ]);
+  });
+
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  ws['!cols'] = [
+    { wch: 18 },
+    { wch: 14 },
+    { wch: 22 },
+    { wch: 14 },
+    { wch: 18 },
+    { wch: 32 },
+    { wch: 48 },
+    { wch: 18 },
+    { wch: 12 },
+    { wch: 18 },
+    { wch: 20 },
+    { wch: 22 },
+    { wch: 16 },
+    { wch: 16 },
+    { wch: 16 },
+    { wch: 24 },
+    { wch: 10 },
+  ];
+
+  XLSX.utils.book_append_sheet(wb, ws, 'All Day Records Log');
+  XLSX.writeFile(wb, `${shopConfig.shopName.replace(/\s+/g, '_')}_${scopeLabel}_${new Date().toISOString().split('T')[0]}.xlsx`);
 }
 
 /**
